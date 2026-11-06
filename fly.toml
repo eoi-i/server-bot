@@ -1,26 +1,22 @@
+
 app = "server-bot-eoi-i"
-primary_region = "iad"
+primary_region = "ams"
 
 [build]
   dockerfile = "Dockerfile"
 
 [env]
   PORT = "8080"
-  LOG_LEVEL = "INFO"
-  DATABASE_PATH = "/data/bot.db"
+  WORK_DIR = "/data"
 
 [http_service]
-  internal_port =  8080
+  internal_port = 8080
   force_https = true
-  auto_stop_machines = "off"
   auto_start_machines = true
+  auto_stop_machines = "stop"
   min_machines_running = 1
 
-[[mounts]]
-  source = "bot_data"
-  destination = "/data"
-
 [[vm]]
-  memory = "256mb"
+  memory = "2gb"
   cpu_kind = "shared"
-  cpus = 1
+  cpus = 2
