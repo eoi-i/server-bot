@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>محلل ومستخرج ملفات APK</title>
+    <style>
+        body { font-family: Tahoma, sans-serif; background-color: #f4f4f9; text-align: center; padding: 50px; }
+        .container { background: white; padding: 30px; border-radius: 10px; display: inline-block; box-shadow: 0px 0px 10px rgba(0,0,0,0.1); }
+        input[type="file"] { margin: 20px 0; }
+        button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #0056b3; }
+        .download-btn { background: #28a745; margin-top: 20px; display: inline-block; text-decoration: none; color: white; padding: 10px 20px; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>استخراج وتحليل ملفات APK</h2>
+        <form action="/upload" method="post" enctype="multipart/form-data">
+            <input type="file" name="apk_file" accept=".apk" required><br>
+            <button type="submit">تحليل واستخراج</button>
+        </form>
+
+        {% if download_ready %}
+            <div style="margin-top: 20px;">
+                <p>تم المعالجة بنجاح!</p>
+                <a class="download-btn" href="/download/{{ filename }}">تنزيل الشفرة والمحتويات (ZIP)</a>
+            </div>
+        {% endif %}
+    </div>
+</body>
+</html>
