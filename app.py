@@ -3,11 +3,8 @@ import zipfile
 import tempfile
 from flask import Flask, render_template, request, send_file, redirect
 
-# تحديد المسار الحالي للملف ليتم قراءة المجلدات بشكل صحيح بغض النظر عن مكان التشغيل
-basedir = os.path.abspath(os.path.dirname(__file__))
-
-app = Flask(__name__, 
-            template_folder=os.path.join(basedir, 'templates'))
+# تعريف التطبيق بحيث يبحث عن مجلد templates في نفس مسار ملف app.py الحالي
+app = Flask(__name__, template_folder='templates')
 
 UPLOAD_FOLDER = tempfile.gettempdir()
 
