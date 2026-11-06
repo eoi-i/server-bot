@@ -1,26 +1,22 @@
-app = "server-bot-w3jeua"<font></font>
-primary_region = "iad"<font></font>
-<font></font>
-[build]<font></font>
-dockerfile = "Dockerfile"<font></font>
-<font></font>
-[env]<font></font>
-DATABASE_PATH = "/data/bot.db"<font></font>
-LOG_LEVEL = "INFO"<font></font>
-PORT = "8080"<font></font>
-<font></font>
-[http_service]<font></font>
-auto_start_machines = true<font></font>
-auto_stop_machines = false<font></font>
-force_https = true<font></font>
-internal_port = 8_080<font></font>
-min_machines_running = 1<font></font>
-<font></font>
-[[mounts]]<font></font>
-destination = "/data"<font></font>
-source = "bot_data"<font></font>
-<font></font>
-[[vm]]<font></font>
-cpu_kind = "shared"<font></font>
-cpus = 1<font></font>
-memory = "256mb"<font></font>
+
+app = "server-bot-w3jeua"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  WORK_DIR = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_start_machines = true
+  auto_stop_machines = "stop"
+  min_machines_running = 1
+
+[[vm]]
+  memory = "2gb"
+  cpu_kind = "shared"
+  cpus = 2
