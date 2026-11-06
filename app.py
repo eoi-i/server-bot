@@ -1,14 +1,19 @@
 import os
 import zipfile
 import tempfile
-from flask import Flask, render_template, request, send_file, redirect, url_for
+from flask import Flask, render_template, request, send_file, redirect
 
-app = Flask(__name__)
+# تحديد المسار الحالي للملف ليتم قراءة المجلدات بشكل صحيح بغض النظر عن مكان التشغيل
+basedir = os.path.abspath(os.path.dirname(__file__))
+
+app = Flask(__name__, 
+            template_folder=os.path.join(basedir, 'templates'))
+
 UPLOAD_FOLDER = tempfile.gettempdir()
 
 @app.route('/')
 def index():
-    return render_template('templates/index.html')
+    return render_template('index.html')
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -23,18 +28,15 @@ def upload_file():
         apk_path = os.path.join(UPLOAD_FOLDER, file.filename)
         file.save(apk_path)
         
-        # مجلد استخراج المحتويات
         extract_dir = os.path.join(UPLOAD_FOLDER, 'extracted_' + os.path.splitext(file.filename)[0])
         os.makedirs(extract_dir, exist_ok=True)
         
-        # فك ملف الـ APK كملف ضغطي واستخراج محتوياته (Resources, AndroidManifest, etc.)
         try:
             with zipfile.ZipFile(apk_path, 'r') as zip_ref:
                 zip_ref.extractall(extract_dir)
         except Exception as e:
             return f"خطأ في تحليل الملف: {str(e)}"
         
-        # إنشاء ملف ZIP نهائي يضم الملفات المستخرجة
         zip_output_path = os.path.join(UPLOAD_FOLDER, f"source_{os.path.splitext(file.filename)[0]}.zip")
         with zipfile.ZipFile(zip_output_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
             for root, dirs, files in os.walk(extract_dir):
