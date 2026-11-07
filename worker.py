@@ -15,6 +15,14 @@ import database
 log = logging.getLogger('apk-analyzer.worker')
 
 
+class ToolTimeoutError(TimeoutError):
+    def __init__(self, tool_name, seconds, output):
+        super().__init__(f'انتهت مهلة {tool_name} بعد {seconds} ثانية.')
+        self.tool_name = tool_name
+        self.seconds = seconds
+        self.output = output
+
+
 def validate_apk(path: Path) -> str:
     if not zipfile.is_zipfile(path):
         raise ValueError('الملف ليس APK صالحاً أو أن محتواه تالف.')
@@ -38,7 +46,7 @@ class AnalysisWorker:
     def __init__(self, data_dir):
         self.data_dir = Path(data_dir)
         self.max_workers = max(1, int(os.getenv('MAX_WORKERS', '2')))
-        self.timeout = max(60, int(os.getenv('MAX_ANALYSIS_SECONDS', '1800')))
+        self.timeout = max(60, int(os.getenv('MAX_ANALYSIS_SECONDS', '7200')))
         self.stop_event = threading.Event()
         self.thread = None
         self.active = set()
@@ -101,9 +109,21 @@ class AnalysisWorker:
                 process.kill()
             except ProcessLookupError:
                 pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+
+    @staticmethod
+    def _read_tail(output, limit=12000):
+        output.seek(0, 2)
+        size = output.tell()
+        output.seek(max(0, size - limit))
+        return output.read().decode('utf-8', errors='replace')
 
     def _run_command(self, command, job_id, timeout, progress_start, progress_end, stage):
-        """Run tool with a bounded stage estimate and visible elapsed-time heartbeat."""
+        """Run a tool with a hard timeout and progress heartbeats; return partial logs on timeout."""
         interval = 3.0
         last_update = 0.0
         started = time.monotonic()
@@ -114,12 +134,12 @@ class AnalysisWorker:
                     elapsed = time.monotonic() - started
                     if elapsed >= timeout:
                         self._kill_process_group(process)
-                        raise TimeoutError(f'انتهت مهلة {stage} بعد {timeout} ثانية.')
+                        partial_log = self._read_tail(output)
+                        raise ToolTimeoutError(stage, timeout, partial_log)
                     if database.cancel_requested(job_id):
                         self._kill_process_group(process)
                         raise InterruptedError(f'ألغى المستخدم المهمة أثناء {stage}.')
                     if elapsed - last_update >= interval:
-                        # This is a stage estimate, not byte-level progress reported by JADX/Apktool.
                         fraction = min(0.92, elapsed / max(timeout, 1))
                         progress = min(progress_end - 1, progress_start + int((progress_end - progress_start) * fraction))
                         database.update_analysis(
@@ -130,12 +150,18 @@ class AnalysisWorker:
                         last_update = elapsed
                     time.sleep(0.5)
                 output.seek(0)
-                text = output.read().decode('utf-8', errors='replace')
-                return text[-12000:], process.returncode
+                return output.read().decode('utf-8', errors='replace')[-12000:], process.returncode
             finally:
                 if process.poll() is None:
                     self._kill_process_group(process)
-                    process.wait(timeout=5)
+
+    @staticmethod
+    def _has_partial_output(jadx_dir, apktool_dir):
+        if jadx_dir.exists() and any(path.is_file() for path in jadx_dir.rglob('*')):
+            return True
+        if apktool_dir.exists() and any(path.is_file() for path in apktool_dir.rglob('*')):
+            return True
+        return False
 
     def process(self, job):
         job_id = job['id']
@@ -157,32 +183,43 @@ class AnalysisWorker:
         except (zipfile.BadZipFile, OSError) as exc:
             raise ValueError('تعذر فتح APK كملف ZIP؛ قد يكون تالفاً.') from exc
 
-        database.update_analysis(job_id, progress=5, message=f'تم التحقق من الحزمة. بدء JADX؛ عدد ملفات DEX: {len(dex)}.')
-        jadx_log, jadx_code = self._run_command(
-            [jadx, '--deobf', '--show-bad-code', '--threads-count', str(min(os.cpu_count() or 2, 4)), '-d', str(jadx_dir), str(apk)],
-            job_id, self.timeout, 8, 43, 'JADX',
-        )
-        (job_dir / 'jadx.log').write_text(jadx_log, encoding='utf-8')
         warnings = []
-        if jadx_code not in (0, 3):
-            warnings.append(f'JADX أنهى برمز {jadx_code}; تم الاحتفاظ بأي مخرجات جزئية.')
+        database.update_analysis(job_id, progress=5, message=f'تم التحقق من الحزمة. بدء JADX؛ عدد ملفات DEX: {len(dex)}.')
+        try:
+            jadx_log, jadx_code = self._run_command(
+                [jadx, '--deobf', '--show-bad-code', '--threads-count', str(min(os.cpu_count() or 2, 4)), '-d', str(jadx_dir), str(apk)],
+                job_id, self.timeout, 8, 43, 'JADX',
+            )
+            (job_dir / 'jadx.log').write_text(jadx_log, encoding='utf-8')
+            if jadx_code not in (0, 3):
+                warnings.append(f'JADX أنهى برمز {jadx_code}; تم الاحتفاظ بأي مخرجات جزئية.')
+        except ToolTimeoutError as exc:
+            (job_dir / 'jadx.log').write_text(exc.output, encoding='utf-8')
+            warnings.append(f'تجاوز JADX مهلة {exc.seconds} ثانية؛ احتُفظ بالمخرجات الجزئية وجرت متابعة Apktool. راجع jadx.log.')
+            database.update_analysis(job_id, progress=43, message='انتهت مهلة JADX؛ تم حفظ نواتجه الجزئية والانتقال إلى Apktool.')
 
-        database.update_analysis(job_id, progress=45, message='اكتمل JADX. بدء Apktool لاستخراج الموارد وSmali.')
-        apktool_log, apktool_code = self._run_command(
-            [apktool, 'd', '-f', str(apk), '-o', str(apktool_dir)],
-            job_id, self.timeout, 47, 70, 'Apktool',
-        )
-        (job_dir / 'apktool.log').write_text(apktool_log, encoding='utf-8')
-        if apktool_code != 0:
-            warnings.append(f'Apktool أنهى برمز {apktool_code}; تم الاحتفاظ بالمخرجات المتاحة.')
+        database.update_analysis(job_id, progress=45, message='بدء Apktool لاستخراج الموارد وSmali.')
+        try:
+            apktool_log, apktool_code = self._run_command(
+                [apktool, 'd', '-f', str(apk), '-o', str(apktool_dir)],
+                job_id, self.timeout, 47, 70, 'Apktool',
+            )
+            (job_dir / 'apktool.log').write_text(apktool_log, encoding='utf-8')
+            if apktool_code != 0:
+                warnings.append(f'Apktool أنهى برمز {apktool_code}; تم الاحتفاظ بالمخرجات المتاحة.')
+        except ToolTimeoutError as exc:
+            (job_dir / 'apktool.log').write_text(exc.output, encoding='utf-8')
+            warnings.append(f'تجاوز Apktool مهلة {exc.seconds} ثانية؛ احتُفظ بالمخرجات الجزئية. راجع apktool.log.')
+            database.update_analysis(job_id, progress=70, message='انتهت مهلة Apktool؛ جارٍ تجهيز أي نتائج جزئية قابلة للاستعادة.')
 
         java_root = jadx_dir / 'sources'
         java_count = sum(1 for _ in java_root.rglob('*.java')) if java_root.exists() else 0
         smali_count = sum(1 for _ in apktool_dir.rglob('*.smali')) if apktool_dir.exists() else 0
-        if not java_count and not smali_count and not (apktool_dir / 'AndroidManifest.xml').exists():
-            raise RuntimeError('لم تنتج JADX أو Apktool مخرجات قابلة للاستعادة. راجع سجلات الأدوات ضمن رسالة الخطأ.')
+        has_manifest = (apktool_dir / 'AndroidManifest.xml').is_file()
+        if not java_count and not smali_count and not has_manifest and not self._has_partial_output(jadx_dir, apktool_dir):
+            raise RuntimeError('انتهت الأدوات دون إنتاج نتائج. راجع سجلات JADX وApktool.')
 
-        database.update_analysis(job_id, progress=76, message='اكتمل الفك. إعداد مشروع الاستعادة وضغط النتائج...')
+        database.update_analysis(job_id, progress=76, message='اكتمل الفك أو تم حفظ النتائج الجزئية. إعداد مشروع الاستعادة وضغط النتائج...')
         main = project / 'app' / 'src' / 'main'
         (main / 'java').mkdir(parents=True, exist_ok=True)
         (main / 'res').mkdir(parents=True, exist_ok=True)
@@ -218,4 +255,7 @@ class AnalysisWorker:
             for path in (job_dir / 'jadx.log', job_dir / 'apktool.log'):
                 if path.exists():
                     result.write(path, path.name)
-        database.update_analysis(job_id, status='completed', progress=100, message=f'اكتمل التحليل: {java_count} Java، {smali_count} Smali.', result_path=str(zip_path))
+        message = f'اكتمل التحليل: {java_count} Java، {smali_count} Smali.'
+        if warnings:
+            message += ' تم إنشاء ZIP جزئي مع تحذيرات؛ راجع RECOVERY-WARNINGS.txt.'
+        database.update_analysis(job_id, status='completed', progress=100, message=message, result_path=str(zip_path))
