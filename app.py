@@ -6,7 +6,7 @@ import time
 from pathlib import Path
 
 import stripe
-from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, abort, jsonify, render_template, request, send_file, session, url_for
 from werkzeug.utils import secure_filename
 
 import database
@@ -99,7 +99,7 @@ def create_app(test_config=None):
         return render_template('analysis_detail.html', analysis=item)
 
     @app.get('/api/csrf-token')
-    def csrf_token():
+    def csrf_token_endpoint():
         if 'csrf_token' not in session:
             session['csrf_token'] = secrets.token_urlsafe(32)
         return jsonify(csrf_token=session['csrf_token'])
@@ -240,6 +240,10 @@ def create_app(test_config=None):
     @app.get('/donation-status')
     def donation_status():
         intent_id = request.args.get('payment_intent', '')
+        if not intent_id:
+            client_secret = request.args.get('payment_intent_client_secret', '')
+            if '_secret_' in client_secret:
+                intent_id = client_secret.split('_secret_', 1)[0]
         try:
             donation = database.get_donation(intent_id) if intent_id else None
         except Exception:

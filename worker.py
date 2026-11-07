@@ -1,11 +1,12 @@
+import hashlib
 import logging
 import os
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 import zipfile
-import hashlib
 from pathlib import Path
 
 import database
@@ -71,6 +72,11 @@ class AnalysisWorker:
     def _process_guarded(self, job):
         try:
             self.process(job)
+        except InterruptedError as exc:
+            try:
+                database.update_analysis(job['id'], status='cancelled', message=str(exc))
+            except Exception:
+                log.exception('Could not persist cancellation')
         except Exception:
             log.exception('Job %s crashed', job['id'])
             try:
@@ -78,29 +84,39 @@ class AnalysisWorker:
             except Exception:
                 log.exception('Could not persist job failure')
         finally:
+            try:
+                Path(job['upload_path']).unlink(missing_ok=True)
+            except OSError:
+                log.warning('Could not clean upload for job %s', job['id'])
             with self.lock:
                 self.active.discard(job['id'])
 
     def _run_command(self, command, job_id, timeout):
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                   errors='replace', start_new_session=True)
-        started = time.monotonic()
-        output = []
-        try:
-            while process.poll() is None:
-                if time.monotonic() - started > timeout:
+        # Redirect output to a temporary file: a PIPE can fill and deadlock while poll() waits.
+        with tempfile.TemporaryFile(mode='w+b') as output:
+            process = subprocess.Popen(
+                command,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+            started = time.monotonic()
+            try:
+                while process.poll() is None:
+                    if time.monotonic() - started > timeout:
+                        process.kill()
+                        raise TimeoutError(f'انتهت مهلة الأمر بعد {timeout} ثانية.')
+                    if database.cancel_requested(job_id):
+                        process.kill()
+                        raise InterruptedError('ألغى المستخدم المهمة.')
+                    time.sleep(0.5)
+                output.seek(0)
+                text = output.read().decode('utf-8', errors='replace')
+                return text[-12000:], process.returncode
+            finally:
+                if process.poll() is None:
                     process.kill()
-                    raise TimeoutError(f'انتهت مهلة الأمر بعد {timeout} ثانية.')
-                if database.cancel_requested(job_id):
-                    process.kill()
-                    raise InterruptedError('ألغى المستخدم المهمة.')
-                time.sleep(0.5)
-            text = process.stdout.read() if process.stdout else ''
-            return text[-12000:], process.returncode
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=5)
+                    process.wait(timeout=5)
 
     def process(self, job):
         job_id = job['id']
@@ -172,4 +188,3 @@ class AnalysisWorker:
                 if path.exists():
                     result.write(path, path.name)
         database.update_analysis(job_id, status='completed', progress=100, message=f'اكتمل التحليل: {java_count} Java، {smali_count} Smali.', result_path=str(zip_path))
-        apk.unlink(missing_ok=True)

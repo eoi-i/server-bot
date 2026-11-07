@@ -8,8 +8,14 @@ from worker import validate_apk
 
 
 @pytest.fixture
- def app_client(tmp_path):
-    app = create_app({'TESTING': True, 'AUTO_INIT_DB': False, 'RUN_WORKER': False, 'DATA_DIR': str(tmp_path), 'MAX_CONTENT_LENGTH': 1024 * 1024})
+def app_client(tmp_path):
+    app = create_app({
+        'TESTING': True,
+        'AUTO_INIT_DB': False,
+        'RUN_WORKER': False,
+        'DATA_DIR': str(tmp_path),
+        'MAX_CONTENT_LENGTH': 1024 * 1024,
+    })
     with app.test_client() as client:
         yield client
 
@@ -40,20 +46,28 @@ def test_csrf_required_for_upload(app_client):
 
 def test_invalid_upload_rejected(app_client):
     token = csrf(app_client)
-    response = app_client.post('/api/analyze', data={'apk': (io.BytesIO(b'not apk'), 'bad.apk')}, headers={'X-CSRFToken': token})
+    response = app_client.post(
+        '/api/analyze',
+        data={'apk': (io.BytesIO(b'not apk'), 'bad.apk')},
+        headers={'X-CSRFToken': token},
+    )
     assert response.status_code == 400
 
 
 def test_non_apk_extension_rejected(app_client):
     token = csrf(app_client)
-    response = app_client.post('/api/analyze', data={'apk': (io.BytesIO(b'x'), 'bad.zip')}, headers={'X-CSRFToken': token})
+    response = app_client.post(
+        '/api/analyze',
+        data={'apk': (io.BytesIO(b'x'), 'bad.zip')},
+        headers={'X-CSRFToken': token},
+    )
     assert response.status_code == 400
 
 
 def test_validate_apk_requires_manifest(tmp_path):
     fake = tmp_path / 'fake.apk'
     with zipfile.ZipFile(fake, 'w') as archive:
-        archive.writestr('classes.dex', b'dex\n035\0')
+        archive.writestr('classes.dex', b'dex\0')
     with pytest.raises(ValueError, match='AndroidManifest'):
         validate_apk(fake)
 
