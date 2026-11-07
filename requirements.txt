@@ -1,5 +1,5 @@
 Flask==3.1.1
 gunicorn==23.0.0
 psycopg[binary]==3.2.9
-stripe==11.7.0
+stripe
 pytest==8.3.5
