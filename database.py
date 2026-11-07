@@ -107,7 +107,7 @@ def cancel_requested(job_id):
 
 
 def clear_all_database_data():
-    """Clear table contents only; never DROP the database or tables and preserve active tasks."""
+    """Delete rows only, not tables/database. Refuse when any analysis worker is active."""
     with connect() as conn:
         conn.execute('LOCK TABLE analyses IN EXCLUSIVE MODE')
         active = conn.execute("SELECT count(*) AS n FROM analyses WHERE status IN ('queued','processing')").fetchone()['n']
@@ -118,7 +118,7 @@ def clear_all_database_data():
         deleted = 0
         for table in ('stripe_events', 'donations', 'analyses'):
             deleted += conn.execute(f'DELETE FROM {table}').rowcount
-    return deleted, 0
+    return True, deleted
 
 
 def recover_stale_jobs(stale_seconds=3600):

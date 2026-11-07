@@ -178,12 +178,13 @@ def create_app(test_config=None):
             return jsonify(error='ميزة مسح قاعدة البيانات غير مفعلة. اضبط ADMIN_TOKEN في أسرار Fly.io.'), 503
         if not supplied or not hmac.compare_digest(supplied, expected):
             return jsonify(error='رمز الإدارة غير صحيح.'), 403
-        if request.get_json(silent=True, force=False) is None or request.get_json(silent=True).get('confirm') != 'DELETE':
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or payload.get('confirm') != 'DELETE':
             return jsonify(error='أرسل تأكيداً صريحاً بقيمة DELETE لإكمال المسح.'), 400
         try:
-            cleared, active = database.clear_all_database_data()
+            cleared, count = database.clear_all_database_data()
             if not cleared:
-                return jsonify(error=f'لم يتم المسح: توجد {active} مهام قيد التنفيذ. ألغها أو انتظر انتهاءها.'), 409
+                return jsonify(error=f'لم يتم المسح: توجد {count} مهام قيد التنفيذ. ألغها أو انتظر انتهاءها.'), 409
             removed = 0
             data_root = Path(app.config['DATA_DIR']).resolve()
             for name in ('uploads', 'work', 'results'):
@@ -199,8 +200,8 @@ def create_app(test_config=None):
                         removed += 1
                     except OSError:
                         log.exception('Unable to remove analysis artifact %s', item)
-            return jsonify(ok=True, deleted_rows=cleared, removed_files=removed,
-                           warning='تم حذف جميع سجلات التحليلات والتبرعات وأحداث Stripe. لم يتم حذف المخطط أو قاعدة البيانات نفسها.')
+            return jsonify(ok=True, deleted_rows=count, removed_files=removed,
+                           warning='تم حذف سجلات التحليلات والتبرعات وأحداث Stripe. لم يتم حذف قاعدة البيانات أو الجداول نفسها.')
         except Exception:
             log.exception('Full database data clear failed')
             return jsonify(error='تعذر مسح البيانات. راجع سجلات الخادم.'), 503

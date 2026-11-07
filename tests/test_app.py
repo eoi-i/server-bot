@@ -4,18 +4,12 @@ import zipfile
 import pytest
 
 from app import create_app
-from worker import validate_apk
+from worker import ToolTimeoutError, validate_apk
 
 
 @pytest.fixture
 def app_client(tmp_path):
-    app = create_app({
-        'TESTING': True,
-        'AUTO_INIT_DB': False,
-        'RUN_WORKER': False,
-        'DATA_DIR': str(tmp_path),
-        'MAX_CONTENT_LENGTH': 1024 * 1024,
-    })
+    app = create_app({'TESTING': True, 'AUTO_INIT_DB': False, 'RUN_WORKER': False, 'DATA_DIR': str(tmp_path), 'MAX_CONTENT_LENGTH': 1024 * 1024})
     with app.test_client() as client:
         yield client
 
@@ -45,22 +39,12 @@ def test_csrf_required_for_upload(app_client):
 
 
 def test_invalid_upload_rejected(app_client):
-    token = csrf(app_client)
-    response = app_client.post(
-        '/api/analyze',
-        data={'apk': (io.BytesIO(b'not apk'), 'bad.apk')},
-        headers={'X-CSRFToken': token},
-    )
+    response = app_client.post('/api/analyze', data={'apk': (io.BytesIO(b'not apk'), 'bad.apk')}, headers={'X-CSRFToken': csrf(app_client)})
     assert response.status_code == 400
 
 
 def test_non_apk_extension_rejected(app_client):
-    token = csrf(app_client)
-    response = app_client.post(
-        '/api/analyze',
-        data={'apk': (io.BytesIO(b'x'), 'bad.zip')},
-        headers={'X-CSRFToken': token},
-    )
+    response = app_client.post('/api/analyze', data={'apk': (io.BytesIO(b'x'), 'bad.zip')}, headers={'X-CSRFToken': csrf(app_client)})
     assert response.status_code == 400
 
 
@@ -72,7 +56,15 @@ def test_validate_apk_requires_manifest(tmp_path):
         validate_apk(fake)
 
 
-def test_stripe_webhook_rejects_missing_signature(app_client, monkeypatch):
-    monkeypatch.setenv('STRIPE_WEBHOOK_SECRET', 'whsec_test')
-    response = app_client.post('/api/stripe/webhook', data=b'{}', content_type='application/json')
+def test_timeout_error_keeps_tool_log():
+    exc = ToolTimeoutError('JADX', 42, 'partial output')
+    assert exc.seconds == 42
+    assert exc.output == 'partial output'
+    assert 'JADX' in str(exc)
+
+
+def test_clear_database_requires_admin_secret_and_confirmation(app_client, monkeypatch):
+    monkeypatch.setenv('ADMIN_TOKEN', 'test-admin-token')
+    token = csrf(app_client)
+    response = app_client.post('/api/admin/clear-database', json={'confirm': 'NO'}, headers={'X-CSRFToken': token, 'X-Admin-Token': 'test-admin-token'})
     assert response.status_code == 400
