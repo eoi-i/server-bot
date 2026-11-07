@@ -1,34 +1,58 @@
-# APK Analyzer — نسخة محسّنة
+# APK Analyzer & Recovery
 
-## الميزات
-- واجهة عربية لرفع APK وتحليلها.
-- لا يوجد حد لحجم APK داخل Flask؛ قد تفرض Fly.io أو الشبكة أو مساحة القرص حدوداً تقنية خارج التطبيق.
-- JADX أولاً، ثم Apktool كأداة بديلة لاستخراج الموارد وSmali عند وجود أخطاء جزئية.
-- تجاوز ملفات DEX التي لا تنتج Smali من الأداتين، بحد أقصى 12 ملفاً. إذا زاد العدد تفشل العملية بالكامل.
-- ضغط ZIP سريع باستخدام مستوى ضغط 1.
-- PostgreSQL عبر `DATABASE_URL`.
-- لوحة حالة اتصال قاعدة البيانات، زمن الاستجابة، حجم قاعدة البيانات، عدد الاتصالات، ذاكرة التطبيق ومساحة التخزين المؤقت.
-- مسح السجلات والملفات من زر محمي برمز `ADMIN_TOKEN`.
-
-## متغيرات البيئة
-- `DATABASE_URL`: رابط PostgreSQL.
-- `SECRET_KEY`: مفتاح Flask عشوائي طويل.
-- `ADMIN_TOKEN`: رمز سري لتمكين زر مسح قاعدة البيانات.
-- `DATA_DIR`: مجلد الملفات المؤقتة، الافتراضي `/tmp/apk-analyzer-data`.
-- `PORT`: المنفذ، الافتراضي `8080`.
+خدمة عربية لتحليل ملفات APK باستخدام JADX وApktool، مع إدارة مهام بالخلفية، نتائج ZIP، وصفحة تبرع Stripe بقيمة 10 GBP. تُطبق تغييرات PostgreSQL بشكل إضافي ولا تحذف السجلات الحالية.
 
 ## التشغيل المحلي
-```bash
+
+يتطلب Python 3.12 وPostgreSQL وJava 21 وJADX 1.5.6 وApktool.
+
+```sh
+python -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+# عدّل DATABASE_URL وSECRET_KEY، ثم حمّل متغيرات .env إلى shell
 python app.py
 ```
-تأكد من تثبيت Java 21 وJADX 1.5.6 وApktool في PATH.
 
-## النشر على Fly.io
-ارفع ملفات المشروع إلى مستودعك أو استبدل ملفات المشروع الحالية، ثم أعد النشر من إعدادات Fly.io. اضبط `DATABASE_URL` و`SECRET_KEY` و`ADMIN_TOKEN` ضمن Secrets.
+أو باستخدام Docker:
 
-## تنبيه حول الملفات الكبيرة
-إزالة حد Flask لا تعني أن الاستضافة تقبل ملفات غير محدودة فعلياً. الذاكرة ومساحة القرص ومدة الاتصال وحدود مزود الاستضافة تظل قيوداً مادية. للملفات الضخمة جداً يفضّل الرفع المباشر إلى تخزين كائنات مثل S3/R2 ثم إرسال رابط الملف للتحليل.
+```sh
+docker build -t apk-analyzer .
+docker run --rm -p 8080:8080 -e DATABASE_URL="$DATABASE_URL" -e SECRET_KEY="$SECRET_KEY" -e BASE_URL=http://localhost:8080 -v apk-data:/data apk-analyzer
+```
 
-## تنبيه حول الاستعادة
-Apktool ينتج Smali وموارد، وليس Java. لذلك يعمل كمسار بديل للحفاظ على منطق التطبيق منخفض المستوى إذا تعذر على JADX إنشاء Java. المشروع الناتج قد يحتاج إلى تعديل يدوي ولا يمثل استعادة حرفية للمصدر الأصلي.
+افتح `http://localhost:8080`. يجب تثبيت قاعدة PostgreSQL قبل التشغيل.
+
+## البيئة
+
+`SECRET_KEY`, `DATABASE_URL`, `BASE_URL`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `DATA_DIR`, `MAX_UPLOAD_BYTES` (100 MiB افتراضياً), `MAX_ANALYSIS_SECONDS` (1800), `MAX_JADX_DEX` (حد تنبيه 12), `MAX_WORKERS` (2). لا تضع مفاتيح Stripe السرية في Git.
+
+## Stripe Test Mode
+
+استخدم مفاتيح Stripe الاختبارية أولاً. أنشئ Webhook على `https://YOUR_HOST/api/stripe/webhook` للأحداث `payment_intent.succeeded`, `payment_intent.payment_failed`, و`payment_intent.processing`. يستخدم Payment Element ولا يتم حفظ رقم البطاقة. واجهة العودة تعرض الحالة المسجلة في الخادم فقط؛ تحديث الحالة لا يتم إلا عبر توقيع Webhook صحيح.
+
+## Fly.io
+
+تحقق من اسم التطبيق وقاعدة البيانات الحالية قبل النشر، وخذ نسخة احتياطية معتادة من PostgreSQL. لا ينفذ التطبيق DROP أو DELETE على جداول الإنتاج. أنشئ Fly volume اسمه `apk_data` بالحجم المناسب، ثم:
+
+```sh
+fly secrets set DATABASE_URL='...' SECRET_KEY='...' BASE_URL='https://YOUR_HOST' STRIPE_PUBLISHABLE_KEY='pk_test_...' STRIPE_SECRET_KEY='sk_test_...' STRIPE_WEBHOOK_SECRET='whsec_...'
+fly deploy
+fly status
+fly logs
+```
+
+يستخدم العامل تخزيناً محلياً دائماً عبر Fly volume وطابور PostgreSQL مع `FOR UPDATE SKIP LOCKED`. ابدأ بآلة تطبيق واحدة لأن حجم الملفات محلي للآلة. لا ترفع عدد النسخ دون تخطيط مشاركة الملفات، كما أن عدة عمليات Gunicorn لا تشارك حدود العامل ولا يُوصى بها؛ Docker يشغل عاملاً واحداً.
+
+## الاختبارات
+
+```sh
+pytest -q
+```
+
+الاختبارات الحالية لا تتصل بقاعدة الإنتاج ولا تشغل JADX أو Apktool. اختبار تحليل APK حقيقي وStripe Test Mode يحتاجان APK مرخصاً وبيئة اختبار خارجية. لا تعتبر البناء أو النشر ناجحاً دون تشغيلهما في بيئتك.
+
+## أمان
+
+الملف المرفوع لا يُنفذ؛ يتم فحص حاوية ZIP ووجود AndroidManifest.xml ثم تمريره لأدوات فك التحليل فقط. يطبق CSRF، حدود رفع، تنزيل محصور داخل DATA_DIR، ترويسات أمان، ورسائل أخطاء عربية. نظام الحد من المعدل داخل الذاكرة لكل عملية؛ للنشر العام أضف WAF أو rate limiter موزعاً.

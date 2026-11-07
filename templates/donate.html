@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="csrf-token" content="{{ csrf_token }}">
+  <title>تبرع للمشروع</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="shell">
+  <header class="topbar"><a class="brand" href="/"><span class="brand-icon">APK</span><span><b>APK Analyzer</b><small>دعم المشروع</small></span></a><nav><a href="/">الرئيسية</a><a href="/history">سجل التحليلات</a></nav></header>
+  <section class="donate-hero"><span class="eyebrow">دعم التطوير المستقل</span><h1>ساعدنا على مواصلة<br><em>تحسين أدوات الاستعادة</em></h1><p>تبرع آمن بقيمة واحدة ثابتة. بيانات البطاقة تتم معالجتها عبر Stripe ولا تصل إلى خوادمنا.</p></section>
+  <section class="panel payment-panel"><div class="amount-card"><small>مبلغ التبرع</small><strong>£10 <i>GBP</i></strong><span>دفعة واحدة · آمنة عبر Stripe</span></div><div id="payment-message" class="notice hidden" role="alert"></div><form id="payment-form"><div id="payment-element"></div><button id="submit-payment" type="submit" class="button primary" disabled>جارٍ تجهيز نموذج الدفع…</button></form><p class="secure-note">🔒 بيانات بطاقتك لا تُخزن في قاعدة بياناتنا.</p></section>
+  <footer><a href="/">العودة للمحلل</a></footer>
+</main>
+<script src="https://js.stripe.com/v3/"></script>
+<script>
+const publishableKey={{ publishable_key|tojson }};
+const form=document.querySelector('#payment-form'),button=document.querySelector('#submit-payment'),message=document.querySelector('#payment-message'),csrf=document.querySelector('meta[name=csrf-token]').content;
+let stripeClient=null,elements=null;
+function showMessage(text){message.textContent=text;message.classList.remove('hidden')}
+async function initPayment(){
+  if(!publishableKey){showMessage('الدفع غير مهيأ: تحقق من STRIPE_PUBLISHABLE_KEY في إعدادات الخدمة.');button.textContent='الدفع غير متاح حالياً';return}
+  try{
+    stripeClient=Stripe(publishableKey);
+    const response=await fetch('/api/create-payment-intent',{method:'POST',headers:{'X-CSRFToken':csrf}});
+    const data=await response.json();
+    if(!response.ok)throw new Error(data.error||`تعذر بدء الدفع (HTTP ${response.status}).`);
+    if(!data.client_secret)throw new Error('لم يُرجع الخادم بيانات تهيئة نموذج Stripe.');
+    elements=stripeClient.elements({clientSecret:data.client_secret,appearance:{theme:'night',labels:'floating'}});
+    elements.create('payment',{layout:'tabs'}).mount('#payment-element');
+    button.disabled=false;button.textContent='ادفع £10 بأمان';
+  }catch(error){showMessage(error.message||'تعذر بدء الدفع. تحقق من إعدادات Stripe ثم راجع سجلات الخادم.');button.disabled=true;button.textContent='تعذر تجهيز الدفع';console.error('Payment initialization failed',error)}
+}
+form.addEventListener('submit',async event=>{
+  event.preventDefault();if(!stripeClient||!elements)return;
+  button.disabled=true;button.textContent='جارٍ تأكيد الدفع…';message.classList.add('hidden');
+  try{
+    const {error}=await stripeClient.confirmPayment({elements,confirmParams:{return_url:location.origin+'/donation-status'},redirect:'if_required'});
+    if(error){showMessage(error.message||'رفض Stripe عملية الدفع. تحقق من بيانات البطاقة أو جرّب طريقة دفع أخرى.');button.disabled=false;button.textContent='إعادة المحاولة · £10'}
+    else{showMessage('أُرسل الدفع للتحقق. ستظهر الحالة بعد تأكيد Stripe عبر الخادم.')}
+  }catch(error){showMessage('تعذر إكمال الدفع. حاول مرة أخرى أو راجع سجلات Stripe.');button.disabled=false;button.textContent='إعادة المحاولة · £10';console.error('Payment confirmation failed',error)}
+});
+initPayment();
+</script>
+</body>
+</html>
