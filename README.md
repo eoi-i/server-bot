@@ -1,34 +1,48 @@
-# APK Analyzer — نسخة محسّنة
+# APK Analyzer & Recovery
 
-## الميزات
-- واجهة عربية لرفع APK وتحليلها.
-- لا يوجد حد لحجم APK داخل Flask؛ قد تفرض Fly.io أو الشبكة أو مساحة القرص حدوداً تقنية خارج التطبيق.
-- JADX أولاً، ثم Apktool كأداة بديلة لاستخراج الموارد وSmali عند وجود أخطاء جزئية.
-- تجاوز ملفات DEX التي لا تنتج Smali من الأداتين، بحد أقصى 12 ملفاً. إذا زاد العدد تفشل العملية بالكامل.
-- ضغط ZIP سريع باستخدام مستوى ضغط 1.
-- PostgreSQL عبر `DATABASE_URL`.
-- لوحة حالة اتصال قاعدة البيانات، زمن الاستجابة، حجم قاعدة البيانات، عدد الاتصالات، ذاكرة التطبيق ومساحة التخزين المؤقت.
-- مسح السجلات والملفات من زر محمي برمز `ADMIN_TOKEN`.
+خدمة Flask عربية لتحليل ملفات APK باستخدام JADX وApktool، حفظ نتائج جزئية، تجميع مشروع استعادة قابل للتحرير، وضغطه كـ ZIP. تستخدم PostgreSQL الحالية عبر ترحيلات SQL إضافية لا تحذف الجداول أو السجلات.
 
-## متغيرات البيئة
-- `DATABASE_URL`: رابط PostgreSQL.
-- `SECRET_KEY`: مفتاح Flask عشوائي طويل.
-- `ADMIN_TOKEN`: رمز سري لتمكين زر مسح قاعدة البيانات.
-- `DATA_DIR`: مجلد الملفات المؤقتة، الافتراضي `/tmp/apk-analyzer-data`.
-- `PORT`: المنفذ، الافتراضي `8080`.
+## التشغيل
 
-## التشغيل المحلي
-```bash
+يتطلب Python 3.12 وJava 21 وJADX 1.5.6 وApktool، بالإضافة إلى PostgreSQL.
+
+```sh
+python -m venv .venv
+. .venv/bin/activate
 pip install -r requirements.txt
+export DATABASE_URL='postgresql://user:password@localhost:5432/apk_analyzer'
+export SECRET_KEY="$(python -c 'import secrets; print(secrets.token_hex(32))')"
+export DATA_DIR="$PWD/data"
 python app.py
 ```
-تأكد من تثبيت Java 21 وJADX 1.5.6 وApktool في PATH.
 
-## النشر على Fly.io
-ارفع ملفات المشروع إلى مستودعك أو استبدل ملفات المشروع الحالية، ثم أعد النشر من إعدادات Fly.io. اضبط `DATABASE_URL` و`SECRET_KEY` و`ADMIN_TOKEN` ضمن Secrets.
+أو: `docker build -t apk-analyzer .` ثم `docker run --rm -p 8080:8080 -e DATABASE_URL=... -e SECRET_KEY=... -v apk-data:/data apk-analyzer`.
 
-## تنبيه حول الملفات الكبيرة
-إزالة حد Flask لا تعني أن الاستضافة تقبل ملفات غير محدودة فعلياً. الذاكرة ومساحة القرص ومدة الاتصال وحدود مزود الاستضافة تظل قيوداً مادية. للملفات الضخمة جداً يفضّل الرفع المباشر إلى تخزين كائنات مثل S3/R2 ثم إرسال رابط الملف للتحليل.
+## إعداد Stripe
 
-## تنبيه حول الاستعادة
-Apktool ينتج Smali وموارد، وليس Java. لذلك يعمل كمسار بديل للحفاظ على منطق التطبيق منخفض المستوى إذا تعذر على JADX إنشاء Java. المشروع الناتج قد يحتاج إلى تعديل يدوي ولا يمثل استعادة حرفية للمصدر الأصلي.
+ضبط `STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET` في الأسرار، جميعها Test Mode أولاً. أنشئ Webhook يشير إلى `https://YOUR_HOST/api/stripe/webhook` واشترك بأحداث `payment_intent.succeeded`, `payment_intent.payment_failed`, و`payment_intent.processing`. التبرع ثابت 10 GBP. لا تحفظ الخدمة بيانات البطاقة؛ Stripe.js وPayment Element يتعاملان معها. حالة النجاح في المتصفح ليست إثباتاً؛ تعرض الحالة قاعدة البيانات التي تحدثها Webhook فقط.
+
+## متغيرات البيئة
+
+`SECRET_KEY`, `DATABASE_URL`, `BASE_URL`, `STRIPE_PUBLISHABLE_KEY`, `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `DATA_DIR`, `MAX_UPLOAD_BYTES` (افتراضي 100 MiB), `MAX_ANALYSIS_SECONDS` (1800), `MAX_JADX_DEX` (حد تنبيه 12), `MAX_WORKERS` (2). لا تضع أسرار Stripe في ملفات المستودع.
+
+## Fly.io
+
+تحقق من اسم التطبيق وقاعدة البيانات قبل النشر، وأرفق PostgreSQL الحالية دون إعادة إنشائها أو حذفها. أنشئ volume دائم باسم `apk_data` بالحجم المناسب. ثم:
+
+```sh
+fly secrets set DATABASE_URL='...' SECRET_KEY='...' BASE_URL='https://YOUR_HOST' STRIPE_PUBLISHABLE_KEY='pk_test_...' STRIPE_SECRET_KEY='sk_test_...' STRIPE_WEBHOOK_SECRET='whsec_...'
+fly deploy
+fly status
+fly logs
+```
+
+أزل مفاتيح test واستبدلها بمفاتيح live فقط بعد الدفع التجريبي وفحص Webhook. الملفات المحلية لكل آلة ليست تخزيناً موزعاً؛ شغل نسخة تطبيق واحدة حالياً. هذا المستودع يستخدم executor داخل العملية، لذا نشر عدة آلات يحتاج طابوراً موزعاً (مثل Redis/RQ) قبل التوسع الأفقي. افحص قوانين وإذن تحليل التطبيقات قبل رفعها.
+
+## الأمان وحدود التشغيل
+
+CSRF على طلبات التغيير باستثناء Webhook الذي يتحقق من التوقيع، cookies آمنة، حد رفع، اسم ملف آمن، فحص بنية ZIP، حدود زمنية، منع مسار التنزيل خارج DATA_DIR، ورسائل خطأ عربية. لا تُشغّل APK أو محتواه. يجب وضع WAF/حماية إضافية للتطبيق العام؛ محدد المعدل الحالي process-local وليس بديلاً عن rate limiter موزع.
+
+## الاختبارات
+
+`pytest -q` يشغّل اختبارات وظائف مساعدة وواجهات باستخدام قاعدة بيانات Postgres تجريبية مطلوبة؛ لا تشغّلها على قاعدة الإنتاج. اختبارات تحليل حقيقية تتطلب أدوات jadx/apktool وAPK fixtures مرخصة. لم يتم تضمين بيانات اعتماد أو APK خاص.

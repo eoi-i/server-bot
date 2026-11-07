@@ -6,17 +6,25 @@ primary_region = "ams"
 
 [env]
   PORT = "8080"
-  DATA_DIR = "/tmp/apk-analyzer-data"
+  DATA_DIR = "/data"
+  MAX_UPLOAD_BYTES = "104857600"
+  MAX_ANALYSIS_SECONDS = "1800"
+  MAX_JADX_DEX = "12"
+  MAX_WORKERS = "2"
 
 [http_service]
   internal_port = 8080
   force_https = true
   auto_stop_machines = "stop"
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
   processes = ["app"]
+
+[[mounts]]
+  source = "apk_data"
+  destination = "/data"
 
 [[vm]]
   memory = "2gb"
   cpu_kind = "shared"
-  cpus = 1
+  cpus = 2

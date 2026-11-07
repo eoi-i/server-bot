@@ -1,322 +1,402 @@
+import hashlib
+import hmac
+import logging
 import os
 import re
-import uuid
-import threading
-import subprocess
+import secrets
 import shutil
-import zipfile
+import subprocess
+import threading
 import time
-from pathlib import Path
+import uuid
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from flask import Flask, render_template, request, jsonify, send_file, abort
+from pathlib import Path
+
+import stripe
+from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, session, url_for
 from werkzeug.utils import secure_filename
-from database import (init_db, create_analysis, update_analysis, get_analysis,
-                      list_analyses, database_metrics, clear_all_analyses)
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.getenv('DATA_DIR', '/tmp/apk-analyzer-data'))
-UPLOAD_DIR = DATA_DIR / 'uploads'
-WORK_DIR = DATA_DIR / 'work'
-RESULT_DIR = DATA_DIR / 'results'
-MAX_FAILED_DEX = 12
-ALLOWED_EXTENSIONS = {'.apk'}
+from database import (
+    create_analysis, create_donation, database_metrics, find_analysis_by_fingerprint,
+    get_analysis, get_donation_by_intent, init_db, list_analyses,
+    mark_interrupted_jobs, recoverable_jobs, update_analysis, update_donation_status,
+)
 
-for directory in (UPLOAD_DIR, WORK_DIR, RESULT_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+logging.basicConfig(level=os.getenv('LOG_LEVEL', 'INFO'))
+log = logging.getLogger('apk-analyzer')
+ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv('DATA_DIR', '/tmp/apk-analyzer-data')).resolve()
+UPLOAD_DIR, WORK_DIR, RESULT_DIR = (DATA_DIR / x for x in ('uploads', 'work', 'results'))
+for folder in (UPLOAD_DIR, WORK_DIR, RESULT_DIR):
+    folder.mkdir(parents=True, exist_ok=True)
 
+MAX_UPLOAD_BYTES = max(1, int(os.getenv('MAX_UPLOAD_BYTES', 100 * 1024 * 1024)))
+MAX_ANALYSIS_SECONDS = max(60, int(os.getenv('MAX_ANALYSIS_SECONDS', 1800)))
+MAX_JADX_DEX = max(1, int(os.getenv('MAX_JADX_DEX', 12)))
+MAX_WORKERS = max(1, int(os.getenv('MAX_WORKERS', 2)))
+BASE_URL = os.getenv('BASE_URL', 'http://localhost:8080').rstrip('/')
 app = Flask(__name__)
-# No application-level APK size limit. Actual limits may still apply at the hosting/network layer.
-app.config['MAX_CONTENT_LENGTH'] = None
-app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change-this-secret-before-production')
-
+app.config.update(
+    SECRET_KEY=os.getenv('SECRET_KEY') or secrets.token_hex(32),
+    MAX_CONTENT_LENGTH=MAX_UPLOAD_BYTES,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    SESSION_COOKIE_SECURE=BASE_URL.startswith('https://'),
+)
+stripe.api_key = os.getenv('STRIPE_SECRET_KEY', '')
 init_db()
+POOL = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix='analysis')
+TASKS = {}
+TASK_LOCK = threading.Lock()
+LIMITS = {}
 
 
-def allowed_file(filename: str) -> bool:
-    return Path(filename).suffix.lower() in ALLOWED_EXTENSIONS
+def csrf_token():
+    if 'csrf' not in session:
+        session['csrf'] = secrets.token_urlsafe(32)
+    return session['csrf']
 
 
-def tool_path(name: str) -> str:
-    path = shutil.which(name)
-    if not path:
-        raise RuntimeError(f'أداة {name} غير مثبتة أو غير موجودة في PATH')
-    return path
+@app.before_request
+def csrf_check():
+    if request.method in {'POST', 'PUT', 'PATCH', 'DELETE'} and request.endpoint != 'stripe_webhook':
+        expected = session.get('csrf')
+        supplied = request.headers.get('X-CSRFToken', '')
+        if not expected or not supplied or not hmac.compare_digest(expected, supplied):
+            abort(403, description='تعذر التحقق الأمني من الطلب. حدّث الصفحة وحاول مجدداً.')
 
 
-def run_command(command, cwd=None, timeout=2400, allowed_returncodes=(0,)):
-    result = subprocess.run(command, cwd=cwd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True, errors='replace',
-                            timeout=timeout, check=False)
-    output = result.stdout or ''
-    if result.returncode not in allowed_returncodes:
-        raise RuntimeError(f"فشل تنفيذ الأمر (exit {result.returncode}):\n{output[-9000:]}")
-    return output, result.returncode
+@app.after_request
+def security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Referrer-Policy'] = 'strict-origin-when-cross-origin'
+    response.headers['Permissions-Policy'] = 'camera=(), microphone=(), geolocation=()'
+    if request.is_secure:
+        response.headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains'
+    return response
 
 
-def dex_entries(apk_path: Path):
+def limited(label, maximum, seconds=60):
+    now = time.monotonic()
+    hits = LIMITS.setdefault(label, [])
+    hits[:] = [t for t in hits if now - t < seconds]
+    if len(hits) >= maximum:
+        return True
+    hits.append(now)
+    return False
+
+
+def digest_file(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def dex_entries(apk):
+    with zipfile.ZipFile(apk) as archive:
+        return sorted(name for name in archive.namelist()
+                      if re.fullmatch(r'classes(?:[2-9]\d*)?\.dex|classes1\.dex', Path(name).name))
+
+
+def run_tool(args, timeout):
     try:
-        with zipfile.ZipFile(apk_path) as zf:
-            return sorted(n for n in zf.namelist()
-                          if re.fullmatch(r'classes(?:\d+)?\.dex', Path(n).name))
-    except Exception:
-        return []
+        result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, errors='replace', timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f'انتهت مهلة الأداة بعد {timeout} ثانية.') from exc
+    return result.stdout[-12000:], result.returncode
 
 
-def expected_smali_dir(apktool_dir: Path, dex_name: str):
-    if dex_name == 'classes.dex':
-        return apktool_dir / 'smali'
-    number = re.fullmatch(r'classes(\d+)\.dex', dex_name)
-    return apktool_dir / f"smali_classes{number.group(1)}" if number else apktool_dir / 'smali'
+def safe_update(job_id, **kwargs):
+    update_analysis(job_id, **kwargs)
 
 
-def make_project_skeleton(project_dir: Path, package_name: str):
-    app_dir = project_dir / 'app' / 'src' / 'main'
-    (app_dir / 'java' / 'recovered').mkdir(parents=True, exist_ok=True)
-    (app_dir / 'res').mkdir(parents=True, exist_ok=True)
-    (app_dir / 'assets').mkdir(parents=True, exist_ok=True)
-    manifest = f'''<?xml version="1.0" encoding="utf-8"?>\n<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{package_name}">\n    <application android:label="Recovered APK" android:allowBackup="false" android:supportsRtl="true">\n    </application>\n</manifest>\n'''
-    (app_dir / 'AndroidManifest.xml').write_text(manifest, encoding='utf-8')
-    (project_dir / 'settings.gradle').write_text("pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = 'RecoveredAPK'\ninclude ':app'\n", encoding='utf-8')
-    (project_dir / 'build.gradle').write_text("plugins { id 'com.android.application' version '8.7.3' apply false }\n", encoding='utf-8')
-    (project_dir / 'app' / 'build.gradle').write_text("plugins { id 'com.android.application' }\n\nandroid {\n    namespace 'recovered.project'\n    compileSdk 35\n    defaultConfig { applicationId 'recovered.project'; minSdk 23; targetSdk 35; versionCode 1; versionName '1.0' }\n}\n", encoding='utf-8')
-    (project_dir / 'README-REBUILD.txt').write_text(
-        'مشروع استعادة أولي للموارد والشفرة المفككة.\n'
-        'JADX ينتج غالباً Java-like حتى لو كان التطبيق الأصلي Kotlin.\n'
-        'ملفات Smali هي بديل احتياطي للفئات التي تعذر تحويلها إلى Java.\n'
-        'قد تحتاج إلى إصلاح التبعيات والموارد يدوياً قبل نجاح البناء.\n', encoding='utf-8')
-
-
-def analyze_job(analysis_id: str, apk_path: Path, original_name: str):
-    job_dir = WORK_DIR / analysis_id
-    output_dir = RESULT_DIR / analysis_id
-    jadx_dir = job_dir / 'jadx'
-    apktool_dir = job_dir / 'apktool'
-    project_dir = job_dir / 'android-project'
+def analyze(job_id, apk_path, filename, cancel):
+    job = WORK_DIR / job_id
+    output = RESULT_DIR / job_id
+    jadx_dir, apktool_dir = job / 'jadx', job / 'apktool'
     logs = []
-    failed_dex = []
     try:
-        job_dir.mkdir(parents=True, exist_ok=True)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        update_analysis(analysis_id, status='processing', message='جارٍ فحص ملف APK...')
-        jadx = tool_path('jadx')
-        apktool = tool_path('apktool')
-        dex_files = dex_entries(apk_path)
-        update_analysis(analysis_id, message='المرحلة 1/3: فك الشفرة باستخدام JADX...')
-
-        # JADX code 3 means partial decompilation; keep all generated sources and try Apktool next.
-        jadx_log, jadx_code = run_command(
-            [jadx, '--deobf', '--show-bad-code', '--threads-count', str(max(2, min(os.cpu_count() or 2, 8))),
-             '-d', str(jadx_dir), str(apk_path)], allowed_returncodes=(0, 3))
-        (job_dir / 'jadx-log.txt').write_text(jadx_log, encoding='utf-8', errors='replace')
-        if jadx_code == 3:
-            logs.append('JADX أنهى الفك جزئياً؛ يجري الآن استخدام Apktool كأداة بديلة لاستخراج Smali والموارد.')
-
-        update_analysis(analysis_id, message='المرحلة 2/3: محاولة الاستعادة البديلة باستخدام Apktool...')
-        apktool_error = None
-        try:
-            apktool_log, _ = run_command([apktool, 'd', '-f', str(apk_path), '-o', str(apktool_dir)], timeout=2400)
-            (job_dir / 'apktool-log.txt').write_text(apktool_log, encoding='utf-8', errors='replace')
-        except Exception as exc:
-            apktool_error = str(exc)
-            logs.append('تعذر على Apktool فك بعض محتويات الحزمة: ' + apktool_error[-2500:])
-
-        # Count failed DEX containers only when neither decompiler produced the alternate Smali output.
-        for dex_name in dex_files:
-            smali_dir = expected_smali_dir(apktool_dir, dex_name)
-            has_smali = smali_dir.exists() and any(smali_dir.rglob('*.smali'))
-            if not has_smali:
-                failed_dex.append(dex_name)
-        if len(failed_dex) > MAX_FAILED_DEX:
-            raise RuntimeError(
-                f'فشلت استعادة {len(failed_dex)} ملفات DEX، والحد الأقصى المسموح {MAX_FAILED_DEX}. '
-                'أُلغيت العملية بالكامل. الملفات: ' + ', '.join(failed_dex[:30]))
-        if failed_dex:
-            logs.append(f'تم تجاوز {len(failed_dex)} ملفات DEX تعذر فكها بالأداتين: {", ".join(failed_dex)}')
-        if apktool_error and not any(apktool_dir.rglob('*')):
-            raise RuntimeError('فشل JADX وApktool ولم ينتج أي محتوى بديل. ' + apktool_error[-2500:])
-
-        update_analysis(analysis_id, message='المرحلة 3/3: تجهيز المشروع وضغط النتائج...')
-        project_dir.mkdir(parents=True, exist_ok=True)
-        package_name = 'recovered.project'
-        manifest_path = apktool_dir / 'AndroidManifest.xml'
-        if manifest_path.exists():
-            match = re.search(r'package="([A-Za-z0-9_.]+)"', manifest_path.read_text(encoding='utf-8', errors='ignore'))
-            if match:
-                package_name = match.group(1)
-        make_project_skeleton(project_dir, package_name)
-
-        if (jadx_dir / 'sources').exists():
-            shutil.copytree(jadx_dir / 'sources', project_dir / 'app/src/main/java/recovered/sources', dirs_exist_ok=True)
-        if (apktool_dir / 'res').exists():
-            shutil.copytree(apktool_dir / 'res', project_dir / 'app/src/main/res', dirs_exist_ok=True)
-        if manifest_path.exists():
-            shutil.copy2(manifest_path, project_dir / 'app/src/main/AndroidManifest.xml')
-        for name in ('assets', 'lib'):
+        job.mkdir(parents=True, exist_ok=True)
+        output.mkdir(parents=True, exist_ok=True)
+        safe_update(job_id, status='processing', progress=3, message='بدء تحليل الحزمة...')
+        if cancel.is_set():
+            raise InterruptedError('ألغى المستخدم المهمة.')
+        if not zipfile.is_zipfile(apk_path):
+            raise ValueError('ملف APK تالف أو ليس ملف ZIP صالحاً.')
+        dex = dex_entries(apk_path)
+        if len(dex) > MAX_JADX_DEX:
+            logs.append(f'عدد ملفات DEX هو {len(dex)}، ويتجاوز حد التنبيه MAX_JADX_DEX={MAX_JADX_DEX}. ستتم متابعة المعالجة ضمن حدود الموارد.')
+        jadx = shutil.which('jadx')
+        apktool = shutil.which('apktool')
+        if not jadx or not apktool:
+            raise RuntimeError('أدوات JADX وApktool مطلوبة. تحقق من تثبيت الأدوات وPATH.')
+        safe_update(job_id, progress=10, message='JADX: فك الشفرة والمصادر...')
+        out, code = run_tool([jadx, '--deobf', '--show-bad-code', '--threads-count', str(min(os.cpu_count() or 2, 4)), '-d', str(jadx_dir), str(apk_path)], MAX_ANALYSIS_SECONDS)
+        (job / 'jadx.log').write_text(out, encoding='utf-8')
+        if code not in (0, 3):
+            logs.append(f'تعثر JADX برمز {code}؛ الاحتفاظ بأي مخرجات جزئية ومتابعة Apktool.')
+        if cancel.is_set():
+            raise InterruptedError('ألغى المستخدم المهمة بعد JADX.')
+        safe_update(job_id, progress=45, message='Apktool: استخراج Smali والموارد والـ Manifest...')
+        out, code = run_tool([apktool, 'd', '-f', str(apk_path), '-o', str(apktool_dir)], MAX_ANALYSIS_SECONDS)
+        (job / 'apktool.log').write_text(out, encoding='utf-8')
+        if code != 0:
+            logs.append(f'تعثر Apktool برمز {code}؛ الاحتفاظ بالمخرجات المتاحة.')
+        if cancel.is_set():
+            raise InterruptedError('ألغى المستخدم المهمة بعد Apktool.')
+        sources = jadx_dir / 'sources'
+        smali_count = sum(1 for _ in apktool_dir.rglob('*.smali')) if apktool_dir.exists() else 0
+        java_count = sum(1 for _ in sources.rglob('*.java')) if sources.exists() else 0
+        has_content = java_count or smali_count or (apktool_dir / 'AndroidManifest.xml').exists() or any(apktool_dir.glob('res/*')) if apktool_dir.exists() else bool(java_count)
+        if not has_content:
+            raise RuntimeError('لم تنتج أدوات التحليل أي ملفات قابلة للاستعادة. راجع سجلات الأدوات.')
+        safe_update(job_id, progress=72, message='إعداد مشروع قابل للتحرير وضغط النتائج...')
+        project = job / 'android-project'
+        main = project / 'app/src/main'
+        (main / 'java').mkdir(parents=True, exist_ok=True)
+        (main / 'res').mkdir(parents=True, exist_ok=True)
+        (main / 'assets').mkdir(parents=True, exist_ok=True)
+        if sources.exists():
+            shutil.copytree(sources, main / 'java/recovered', dirs_exist_ok=True)
+        for name in ('res', 'assets', 'lib'):
             src = apktool_dir / name
             if src.exists():
-                shutil.copytree(src, project_dir / 'app/src/main' / name, dirs_exist_ok=True)
-        for smali_dir in sorted(apktool_dir.glob('smali*')):
-            if smali_dir.is_dir():
-                shutil.copytree(smali_dir, project_dir / 'smali' / smali_dir.name, dirs_exist_ok=True)
-        if (apktool_dir / 'original').exists():
-            shutil.copytree(apktool_dir / 'original', project_dir / 'apktool-original', dirs_exist_ok=True)
-
-        java_count = sum(1 for _ in (jadx_dir / 'sources').rglob('*.java')) if (jadx_dir / 'sources').exists() else 0
-        smali_count = sum(1 for _ in apktool_dir.rglob('*.smali')) if apktool_dir.exists() else 0
-        (project_dir / 'ANALYSIS-REPORT.txt').write_text(
-            f'APK: {original_name}\nملفات DEX: {len(dex_files)}\nملفات Java الناتجة: {java_count}\nملفات Smali المستعادة: {smali_count}\nملفات DEX الفاشلة: {len(failed_dex)} من الحد الأقصى {MAX_FAILED_DEX}\n\n' + '\n'.join(logs),
-            encoding='utf-8')
+                shutil.copytree(src, main / name, dirs_exist_ok=True)
+        manifest = apktool_dir / 'AndroidManifest.xml'
+        if manifest.exists():
+            shutil.copy2(manifest, main / 'AndroidManifest.xml')
+        for child in apktool_dir.glob('smali*'):
+            if child.is_dir():
+                shutil.copytree(child, project / 'smali' / child.name, dirs_exist_ok=True)
+        (project / 'settings.gradle').write_text("pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\ndependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\nrootProject.name = 'RecoveredProject'\ninclude ':app'\n", encoding='utf-8')
+        (project / 'build.gradle').write_text("plugins { id 'com.android.application' version '8.7.3' apply false }\n", encoding='utf-8')
+        (project / 'app/build.gradle').write_text("plugins { id 'com.android.application' }\nandroid { namespace 'recovered.project'; compileSdk 35; defaultConfig { applicationId 'recovered.project'; minSdk 23; targetSdk 35; versionCode 1; versionName '1.0' } }\n", encoding='utf-8')
+        (project / 'ANALYSIS-REPORT.txt').write_text(f'APK: {filename}\nDEX files: {len(dex)}\nJava files: {java_count}\nSmali files: {smali_count}\n', encoding='utf-8')
         if logs:
-            (project_dir / 'RECOVERY-WARNINGS.txt').write_text('\n'.join(logs) + '\n', encoding='utf-8')
-
-        archive_path = output_dir / f'{analysis_id}-recovered-project.zip'
-        with zipfile.ZipFile(archive_path, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
-            for file_path in project_dir.rglob('*'):
-                if file_path.is_file():
-                    archive.write(file_path, file_path.relative_to(project_dir.parent))
-            for log_name in ('jadx-log.txt', 'apktool-log.txt'):
-                log_path = job_dir / log_name
-                if log_path.exists():
-                    archive.write(log_path, log_name)
-            for root_name, root in [('jadx-output', jadx_dir), ('apktool-output', apktool_dir)]:
+            (project / 'RECOVERY-WARNINGS.txt').write_text('\n'.join(logs), encoding='utf-8')
+        archive = output / f'{job_id}-recovered.zip'
+        with zipfile.ZipFile(archive, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+            for path in project.rglob('*'):
+                if path.is_file():
+                    zf.write(path, path.relative_to(project.parent))
+            for path in (job / 'jadx.log', job / 'apktool.log'):
+                if path.exists():
+                    zf.write(path, path.name)
+            for label, root in (('jadx-output', jadx_dir), ('apktool-output', apktool_dir)):
                 if root.exists():
-                    for file_path in root.rglob('*'):
-                        if file_path.is_file():
-                            archive.write(file_path, Path(root_name) / file_path.relative_to(root))
-
-        message = f'اكتمل التحليل. Java: {java_count}، Smali: {smali_count}، ملفات DEX المتجاوزة: {len(failed_dex)}.'
-        if logs:
-            message += ' توجد ملاحظات داخل RECOVERY-WARNINGS.txt.'
-        update_analysis(analysis_id, status='completed', message=message, result_path=str(archive_path))
+                    for path in root.rglob('*'):
+                        if path.is_file():
+                            zf.write(path, Path(label) / path.relative_to(root))
+        safe_update(job_id, status='completed', progress=100, message=f'اكتمل التحليل: {java_count} Java و{smali_count} Smali.', result_path=str(archive))
+    except InterruptedError as exc:
+        safe_update(job_id, status='cancelled', message=str(exc))
     except Exception as exc:
-        update_analysis(analysis_id, status='failed', message=str(exc)[:8000])
+        log.exception('Analysis %s failed', job_id)
+        safe_update(job_id, status='failed', message=str(exc)[:4000])
     finally:
         try:
             apk_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        except OSError:
+            log.warning('Unable to remove upload for %s', job_id)
+        with TASK_LOCK:
+            TASKS.pop(job_id, None)
+
+
+def start_job(job_id, path, filename):
+    cancel = threading.Event()
+    with TASK_LOCK:
+        future = POOL.submit(analyze, job_id, Path(path), filename, cancel)
+        TASKS[job_id] = (cancel, future)
+
+
+def recover_jobs():
+    mark_interrupted_jobs()
+    for record in recoverable_jobs():
+        path = Path(record.get('upload_path') or '')
+        if path.is_file():
+            start_job(record['id'], path, record['filename'])
+        else:
+            update_analysis(record['id'], status='failed', message='服務重啟後找不到上傳檔案，無法自動復原此任務。')
+
+
+recover_jobs()
 
 
 @app.get('/')
 def index():
-    return render_template('index.html', history=list_analyses(limit=10), admin_enabled=bool(os.getenv('ADMIN_TOKEN')))
+    return render_template('index.html', csrf=csrf_token(), history=list_analyses(10), limit=MAX_UPLOAD_BYTES)
 
 
-@app.post('/api/analyze')
-def upload_apk():
-    uploaded = request.files.get('apk')
-    if not uploaded or not uploaded.filename:
-        return jsonify({'error': 'اختر ملف APK أولاً'}), 400
-    if not allowed_file(uploaded.filename):
-        return jsonify({'error': 'الملف يجب أن يكون بامتداد APK'}), 400
-    analysis_id = uuid.uuid4().hex
-    safe_name = secure_filename(uploaded.filename) or 'application.apk'
-    stored_path = UPLOAD_DIR / f'{analysis_id}-{safe_name}'
-    uploaded.save(stored_path)
-    try:
-        create_analysis(analysis_id, safe_name, str(stored_path))
-    except Exception:
-        stored_path.unlink(missing_ok=True)
-        raise
-    threading.Thread(target=analyze_job, args=(analysis_id, stored_path, safe_name), daemon=True).start()
-    return jsonify({'id': analysis_id, 'status': 'queued'})
+@app.get('/history')
+def history_page():
+    return render_template('history.html', csrf=csrf_token(), history=list_analyses(100))
 
 
-@app.get('/api/status/<analysis_id>')
-def status(analysis_id):
-    record = get_analysis(analysis_id)
-    if not record:
-        return jsonify({'error': 'العملية غير موجودة'}), 404
-    return jsonify(record)
+@app.get('/analysis/<job_id>')
+def analysis_page(job_id):
+    item = get_analysis(job_id)
+    if not item:
+        abort(404)
+    return render_template('analysis_detail.html', csrf=csrf_token(), analysis=item)
 
 
 @app.get('/api/history')
-def history():
-    return jsonify(list_analyses(limit=50))
+def history_api():
+    return jsonify(list_analyses(100))
+
+
+@app.get('/api/status/<job_id>')
+def status_api(job_id):
+    item = get_analysis(job_id)
+    if not item:
+        return jsonify(error='عملية التحليل غير موجودة.'), 404
+    return jsonify(item)
+
+
+@app.post('/api/analyze')
+def upload_api():
+    if limited('upload:' + (request.remote_addr or 'unknown'), 5):
+        return jsonify(error='طلبات كثيرة. انتظر قليلاً ثم حاول مجدداً.'), 429
+    upload = request.files.get('apk')
+    if not upload or not upload.filename:
+        return jsonify(error='اختر ملف APK أولاً.'), 400
+    if Path(upload.filename).suffix.lower() != '.apk':
+        return jsonify(error='يجب أن يكون امتداد الملف APK.'), 400
+    name = secure_filename(upload.filename) or 'application.apk'
+    job_id = uuid.uuid4().hex
+    path = UPLOAD_DIR / f'{job_id}.apk'
+    upload.save(path)
+    try:
+        size = path.stat().st_size
+        if size == 0 or size > MAX_UPLOAD_BYTES:
+            raise ValueError('حجم الملف فارغ أو يتجاوز الحد المسموح.')
+        if not zipfile.is_zipfile(path):
+            raise ValueError('الملف ليس APK صالحاً أو أن محتواه تالف.')
+        fingerprint = digest_file(path)
+        previous = find_analysis_by_fingerprint(fingerprint)
+        if previous and previous['status'] in {'queued', 'processing', 'completed'}:
+            raise FileExistsError('هذا الملف قيد المعالجة أو سبق تحليله.')
+        create_analysis(job_id, name, str(path), size, fingerprint)
+        start_job(job_id, path, name)
+        return jsonify(id=job_id, status='queued', detail=url_for('analysis_page', job_id=job_id)), 202
+    except FileExistsError as exc:
+        path.unlink(missing_ok=True)
+        return jsonify(error=str(exc)), 409
+    except Exception as exc:
+        path.unlink(missing_ok=True)
+        return jsonify(error=str(exc)), 400
+
+
+@app.post('/api/cancel/<job_id>')
+def cancel_api(job_id):
+    item = get_analysis(job_id)
+    if not item:
+        return jsonify(error='عملية التحليل غير موجودة.'), 404
+    task = TASKS.get(job_id)
+    if item['status'] not in {'queued', 'processing'} or not task:
+        return jsonify(error='لا يمكن إلغاء هذه المهمة الآن.'), 409
+    task[0].set()
+    update_analysis(job_id, status='cancelled', message='تم طلب إلغاء المهمة؛ سيُوقف التحليل عند أقرب نقطة آمنة.')
+    return jsonify(status='cancelled')
 
 
 @app.get('/api/metrics')
-def metrics():
+def metrics_api():
     try:
-        db = database_metrics()
-        try:
-            import psutil
-            process = psutil.Process(os.getpid())
-            memory = process.memory_info().rss
-            system = psutil.virtual_memory()
-            memory_info = {'process_bytes': memory, 'process': _human_bytes(memory),
-                           'system_total': _human_bytes(system.total),
-                           'system_available': _human_bytes(system.available),
-                           'system_percent': system.percent}
-        except Exception:
-            memory_info = {'process': 'غير متاح', 'system_total': 'غير متاح', 'system_available': 'غير متاح'}
-        disk = shutil.disk_usage(DATA_DIR)
-        db['connected'] = True
-        return jsonify({'database': db, 'memory': memory_info,
-                        'disk': {'total': _human_bytes(disk.total), 'free': _human_bytes(disk.free),
-                                 'used_percent': round(disk.used / disk.total * 100, 1) if disk.total else 0},
-                        'server_time': datetime.now(timezone.utc).isoformat()})
-    except Exception as exc:
-        return jsonify({'database': {'connected': False, 'error': str(exc)[:500]}, 'server_time': datetime.now(timezone.utc).isoformat()}), 503
+        return jsonify(database=database_metrics(), server_time=datetime.now(timezone.utc).isoformat())
+    except Exception:
+        log.exception('Metrics query failed')
+        return jsonify(error='تعذر قراءة مؤشرات قاعدة البيانات.'), 503
 
 
-def _human_bytes(value):
-    value = float(value)
-    for unit in ('B', 'KB', 'MB', 'GB', 'TB'):
-        if value < 1024 or unit == 'TB':
-            return f'{value:.1f} {unit}'
-        value /= 1024
+@app.get('/donate')
+def donate_page():
+    return render_template('donate.html', csrf=csrf_token(), publishable_key=os.getenv('STRIPE_PUBLISHABLE_KEY', ''))
 
 
-@app.post('/api/admin/clear-database')
-def clear_database():
-    expected = os.getenv('ADMIN_TOKEN')
-    supplied = request.headers.get('X-Admin-Token', '')
-    if not expected:
-        return jsonify({'error': 'ميزة المسح غير مفعلة. أضف ADMIN_TOKEN إلى أسرار التطبيق.'}), 503
-    import hmac
-    if not hmac.compare_digest(supplied, expected):
-        return jsonify({'error': 'رمز الإدارة غير صحيح.'}), 403
+@app.post('/api/create-payment-intent')
+def create_payment_intent():
+    if limited('donate:' + (request.remote_addr or 'unknown'), 8):
+        return jsonify(error='طلبات كثيرة. حاول لاحقاً.'), 429
+    if not stripe.api_key or not os.getenv('STRIPE_PUBLISHABLE_KEY'):
+        return jsonify(error='الدفع غير مهيأ حالياً. يرجى المحاولة لاحقاً.'), 503
     try:
-        ok, count = clear_all_analyses()
-        if not ok:
-            return jsonify({'error': f'لا يمكن المسح حالياً؛ توجد {count} عمليات قيد التنفيذ.'}), 409
-        removed_files = 0
-        for folder in (UPLOAD_DIR, WORK_DIR, RESULT_DIR):
-            for item in folder.iterdir():
-                try:
-                    if item.is_dir():
-                        shutil.rmtree(item)
-                    else:
-                        item.unlink(missing_ok=True)
-                    removed_files += 1
-                except Exception:
-                    pass
-        return jsonify({'ok': True, 'deleted_records': count, 'removed_items': removed_files})
-    except Exception as exc:
-        return jsonify({'error': str(exc)[:1000]}), 500
+        intent = stripe.PaymentIntent.create(amount=1000, currency='gbp', automatic_payment_methods={'enabled': True}, description='تبرع لمشروع APK Analyzer')
+        create_donation(intent.id, 1000, 'pending')
+        return jsonify(client_secret=intent.client_secret, payment_intent_id=intent.id)
+    except stripe.error.StripeError:
+        log.exception('Stripe PaymentIntent creation failed')
+        return jsonify(error='تعذر بدء الدفع بأمان. لم يتم حفظ بيانات البطاقة.'), 502
 
 
-@app.get('/download/<analysis_id>')
-def download(analysis_id):
-    record = get_analysis(analysis_id)
-    if not record or record.get('status') != 'completed' or not record.get('result_path'):
+@app.post('/api/stripe/webhook')
+def stripe_webhook():
+    secret = os.getenv('STRIPE_WEBHOOK_SECRET', '')
+    if not secret:
+        return jsonify(error='Webhook غير مهيأ.'), 503
+    try:
+        event = stripe.Webhook.construct_event(request.get_data(), request.headers.get('Stripe-Signature', ''), secret)
+    except (ValueError, stripe.error.SignatureVerificationError):
+        return jsonify(error='توقيع Webhook غير صالح.'), 400
+    obj = event['data']['object']
+    mapping = {'payment_intent.succeeded': 'succeeded', 'payment_intent.payment_failed': 'failed', 'payment_intent.processing': 'processing'}
+    if event['type'] in mapping:
+        update_donation_status(obj['id'], mapping[event['type']])
+    return jsonify(received=True)
+
+
+@app.get('/donation-status')
+def donation_status():
+    intent_id = request.args.get('payment_intent') or request.args.get('payment_intent_id', '')
+    donation = get_donation_by_intent(intent_id) if intent_id else None
+    return render_template('donation_status.html', donation=donation)
+
+
+@app.get('/download/<job_id>')
+def download(job_id):
+    record = get_analysis(job_id)
+    if not record or record['status'] != 'completed' or not record.get('result_path'):
         abort(404)
-    path = Path(record['result_path'])
-    if not path.is_file():
-        abort(404, description='ملف النتيجة غير موجود؛ مساحة الملفات المؤقتة قد تكون أُعيد إنشاؤها.')
-    return send_file(path, as_attachment=True, download_name=f'apk-recovered-{analysis_id[:8]}.zip')
-
-
-@app.errorhandler(413)
-def too_large(_error):
-    return jsonify({'error': 'تعذر استقبال الملف بسبب حدّ مفروض من الخادم أو وسيط الشبكة، وليس من حد داخل التطبيق.'}), 413
+    root = RESULT_DIR.resolve()
+    target = Path(record['result_path']).resolve()
+    if root not in target.parents or not target.is_file():
+        abort(404)
+    return send_file(target, as_attachment=True, download_name=f'apk-recovered-{job_id[:8]}.zip')
 
 
 @app.get('/health')
 def health():
-    return jsonify({'ok': True, 'service': 'apk-analyzer', 'time': datetime.now(timezone.utc).isoformat()})
+    return jsonify(ok=True, service='apk-analyzer')
+
+
+@app.errorhandler(413)
+def too_large(_error):
+    return jsonify(error=f'الملف أكبر من الحد المسموح ({MAX_UPLOAD_BYTES} bytes).'), 413
+
+
+@app.errorhandler(403)
+def forbidden(error):
+    return jsonify(error=error.description or 'الطلب غير مسموح.'), 403
+
+
+@app.errorhandler(404)
+def missing(_error):
+    if request.path.startswith('/api/'):
+        return jsonify(error='المورد المطلوب غير موجود.'), 404
+    return render_template('error.html', message='الصفحة المطلوبة غير موجودة.'), 404
+
+
+@app.errorhandler(500)
+def internal_error(_error):
+    log.exception('Unhandled request error')
+    return jsonify(error='حدث خطأ داخلي. يرجى المحاولة لاحقاً.'), 500
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '8080')), debug=False)
+    app.run(host='0.0.0.0', port=int(os.getenv('PORT', '8080')))
