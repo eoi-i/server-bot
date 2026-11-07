@@ -2,6 +2,7 @@ import hashlib
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -77,10 +78,10 @@ class AnalysisWorker:
                 database.update_analysis(job['id'], status='cancelled', message=str(exc))
             except Exception:
                 log.exception('Could not persist cancellation')
-        except Exception:
-            log.exception('Job %s crashed', job['id'])
+        except Exception as exc:
+            log.exception('Job %s failed: %s', job['id'], exc)
             try:
-                database.update_analysis(job['id'], status='failed', message='تعذر إكمال التحليل بسبب خطأ داخلي في العامل.')
+                database.update_analysis(job['id'], status='failed', message=str(exc)[:3000])
             except Exception:
                 log.exception('Could not persist job failure')
         finally:
@@ -91,31 +92,49 @@ class AnalysisWorker:
             with self.lock:
                 self.active.discard(job['id'])
 
-    def _run_command(self, command, job_id, timeout):
-        # Redirect output to a temporary file: a PIPE can fill and deadlock while poll() waits.
+    @staticmethod
+    def _kill_process_group(process):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, AttributeError):
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+
+    def _run_command(self, command, job_id, timeout, progress_start, progress_end, stage):
+        """Run tool with a bounded stage estimate and visible elapsed-time heartbeat."""
+        interval = 3.0
+        last_update = 0.0
+        started = time.monotonic()
         with tempfile.TemporaryFile(mode='w+b') as output:
-            process = subprocess.Popen(
-                command,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-            started = time.monotonic()
+            process = subprocess.Popen(command, stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
             try:
                 while process.poll() is None:
-                    if time.monotonic() - started > timeout:
-                        process.kill()
-                        raise TimeoutError(f'انتهت مهلة الأمر بعد {timeout} ثانية.')
+                    elapsed = time.monotonic() - started
+                    if elapsed >= timeout:
+                        self._kill_process_group(process)
+                        raise TimeoutError(f'انتهت مهلة {stage} بعد {timeout} ثانية.')
                     if database.cancel_requested(job_id):
-                        process.kill()
-                        raise InterruptedError('ألغى المستخدم المهمة.')
+                        self._kill_process_group(process)
+                        raise InterruptedError(f'ألغى المستخدم المهمة أثناء {stage}.')
+                    if elapsed - last_update >= interval:
+                        # This is a stage estimate, not byte-level progress reported by JADX/Apktool.
+                        fraction = min(0.92, elapsed / max(timeout, 1))
+                        progress = min(progress_end - 1, progress_start + int((progress_end - progress_start) * fraction))
+                        database.update_analysis(
+                            job_id,
+                            progress=progress,
+                            message=f'{stage} قيد التنفيذ منذ {int(elapsed)} ثانية (التقدم تقريبي؛ الأداة لا توفر نسبة دقيقة).',
+                        )
+                        last_update = elapsed
                     time.sleep(0.5)
                 output.seek(0)
                 text = output.read().decode('utf-8', errors='replace')
                 return text[-12000:], process.returncode
             finally:
                 if process.poll() is None:
-                    process.kill()
+                    self._kill_process_group(process)
                     process.wait(timeout=5)
 
     def process(self, job):
@@ -128,30 +147,42 @@ class AnalysisWorker:
         job_dir.mkdir(parents=True, exist_ok=True)
         output_dir.mkdir(parents=True, exist_ok=True)
         if not apk.is_file():
-            raise FileNotFoundError('ملف APK غير موجود في التخزين الدائم.')
-        jadx = shutil.which('jadx')
-        apktool = shutil.which('apktool')
+            raise FileNotFoundError('ملف APK غير موجود. أعد رفعه لبدء التحليل.')
+        jadx, apktool = shutil.which('jadx'), shutil.which('apktool')
         if not jadx or not apktool:
-            raise RuntimeError('أدوات JADX وApktool غير مثبتة.')
-        with zipfile.ZipFile(apk) as archive:
-            dex = sorted(n for n in archive.namelist() if Path(n).name == 'classes.dex' or (Path(n).name.startswith('classes') and Path(n).name.endswith('.dex')))
-        database.update_analysis(job_id, progress=8, message='JADX: استخراج المصادر...')
-        jadx_log, jadx_code = self._run_command([jadx, '--deobf', '--show-bad-code', '--threads-count', str(min(os.cpu_count() or 2, 4)), '-d', str(jadx_dir), str(apk)], job_id, self.timeout)
+            raise RuntimeError('أدوات JADX وApktool غير مثبتة في صورة التشغيل.')
+        try:
+            with zipfile.ZipFile(apk) as archive:
+                dex = sorted(name for name in archive.namelist() if Path(name).name == 'classes.dex' or (Path(name).name.startswith('classes') and Path(name).name.endswith('.dex')))
+        except (zipfile.BadZipFile, OSError) as exc:
+            raise ValueError('تعذر فتح APK كملف ZIP؛ قد يكون تالفاً.') from exc
+
+        database.update_analysis(job_id, progress=5, message=f'تم التحقق من الحزمة. بدء JADX؛ عدد ملفات DEX: {len(dex)}.')
+        jadx_log, jadx_code = self._run_command(
+            [jadx, '--deobf', '--show-bad-code', '--threads-count', str(min(os.cpu_count() or 2, 4)), '-d', str(jadx_dir), str(apk)],
+            job_id, self.timeout, 8, 43, 'JADX',
+        )
         (job_dir / 'jadx.log').write_text(jadx_log, encoding='utf-8')
         warnings = []
         if jadx_code not in (0, 3):
             warnings.append(f'JADX أنهى برمز {jadx_code}; تم الاحتفاظ بأي مخرجات جزئية.')
-        database.update_analysis(job_id, progress=45, message='Apktool: استخراج Smali والموارد والـ Manifest...')
-        apktool_log, apktool_code = self._run_command([apktool, 'd', '-f', str(apk), '-o', str(apktool_dir)], job_id, self.timeout)
+
+        database.update_analysis(job_id, progress=45, message='اكتمل JADX. بدء Apktool لاستخراج الموارد وSmali.')
+        apktool_log, apktool_code = self._run_command(
+            [apktool, 'd', '-f', str(apk), '-o', str(apktool_dir)],
+            job_id, self.timeout, 47, 70, 'Apktool',
+        )
         (job_dir / 'apktool.log').write_text(apktool_log, encoding='utf-8')
         if apktool_code != 0:
             warnings.append(f'Apktool أنهى برمز {apktool_code}; تم الاحتفاظ بالمخرجات المتاحة.')
+
         java_root = jadx_dir / 'sources'
         java_count = sum(1 for _ in java_root.rglob('*.java')) if java_root.exists() else 0
         smali_count = sum(1 for _ in apktool_dir.rglob('*.smali')) if apktool_dir.exists() else 0
         if not java_count and not smali_count and not (apktool_dir / 'AndroidManifest.xml').exists():
-            raise RuntimeError('لم تُنتج الأدوات أي نتائج قابلة للتنزيل.')
-        database.update_analysis(job_id, progress=75, message='إنشاء مشروع الاستعادة وضغط النتائج...')
+            raise RuntimeError('لم تنتج JADX أو Apktool مخرجات قابلة للاستعادة. راجع سجلات الأدوات ضمن رسالة الخطأ.')
+
+        database.update_analysis(job_id, progress=76, message='اكتمل الفك. إعداد مشروع الاستعادة وضغط النتائج...')
         main = project / 'app' / 'src' / 'main'
         (main / 'java').mkdir(parents=True, exist_ok=True)
         (main / 'res').mkdir(parents=True, exist_ok=True)

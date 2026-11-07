@@ -106,15 +106,19 @@ def cancel_requested(job_id):
         return bool(row and row['cancel_requested'])
 
 
-def clear_analysis_history():
-    """Delete analysis rows only, atomically refusing to clear queued/running jobs. Donations/events stay intact."""
+def clear_all_database_data():
+    """Clear table contents only; never DROP the database or tables and preserve active tasks."""
     with connect() as conn:
         conn.execute('LOCK TABLE analyses IN EXCLUSIVE MODE')
         active = conn.execute("SELECT count(*) AS n FROM analyses WHERE status IN ('queued','processing')").fetchone()['n']
         if active:
             return False, active
-        deleted = conn.execute('DELETE FROM analyses').rowcount
-    return True, deleted
+        conn.execute('LOCK TABLE donations IN EXCLUSIVE MODE')
+        conn.execute('LOCK TABLE stripe_events IN EXCLUSIVE MODE')
+        deleted = 0
+        for table in ('stripe_events', 'donations', 'analyses'):
+            deleted += conn.execute(f'DELETE FROM {table}').rowcount
+    return deleted, 0
 
 
 def recover_stale_jobs(stale_seconds=3600):

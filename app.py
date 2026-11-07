@@ -2,8 +2,8 @@ import hmac
 import logging
 import os
 import secrets
-import time
 import shutil
+import time
 from pathlib import Path
 
 import stripe
@@ -170,16 +170,18 @@ def create_app(test_config=None):
             return jsonify(error='لا يمكن إلغاء هذه المهمة؛ ربما انتهت بالفعل.'), 409
         return jsonify(status='cancel_requested')
 
-    @app.post('/api/admin/clear-analyses')
-    def clear_analyses_api():
+    @app.post('/api/admin/clear-database')
+    def clear_database_api():
         expected = os.getenv('ADMIN_TOKEN', '')
         supplied = request.headers.get('X-Admin-Token', '')
         if not expected:
-            return jsonify(error='ميزة مسح سجل التحليلات غير مفعلة. اضبط ADMIN_TOKEN ��ي أسرار Fly.io.'), 503
+            return jsonify(error='ميزة مسح قاعدة البيانات غير مفعلة. اضبط ADMIN_TOKEN في أسرار Fly.io.'), 503
         if not supplied or not hmac.compare_digest(supplied, expected):
             return jsonify(error='رمز الإدارة غير صحيح.'), 403
+        if request.get_json(silent=True, force=False) is None or request.get_json(silent=True).get('confirm') != 'DELETE':
+            return jsonify(error='أرسل تأكيداً صريحاً بقيمة DELETE لإكمال المسح.'), 400
         try:
-            cleared, active = database.clear_analysis_history()
+            cleared, active = database.clear_all_database_data()
             if not cleared:
                 return jsonify(error=f'لم يتم المسح: توجد {active} مهام قيد التنفيذ. ألغها أو انتظر انتهاءها.'), 409
             removed = 0
@@ -197,11 +199,11 @@ def create_app(test_config=None):
                         removed += 1
                     except OSError:
                         log.exception('Unable to remove analysis artifact %s', item)
-            return jsonify(ok=True, deleted_analyses=active, removed_items=removed,
-                           note='تم حذف سجلات التحليلات وملفاتها فقط؛ سجلات التبرعات لم تتغير.')
+            return jsonify(ok=True, deleted_rows=cleared, removed_files=removed,
+                           warning='تم حذف جميع سجلات التحليلات والتبرعات وأحداث Stripe. لم يتم حذف المخطط أو قاعدة البيانات نفسها.')
         except Exception:
-            log.exception('Analysis history clear failed')
-            return jsonify(error='تعذر مسح سجل التحليلات. راجع سجلات الخادم.'), 503
+            log.exception('Full database data clear failed')
+            return jsonify(error='تعذر مسح البيانات. راجع سجلات الخادم.'), 503
 
     @app.get('/download/<job_id>')
     def download(job_id):
@@ -226,24 +228,21 @@ def create_app(test_config=None):
         secret_key = os.getenv('STRIPE_SECRET_KEY', '').strip()
         publishable_key = os.getenv('STRIPE_PUBLISHABLE_KEY', '').strip()
         if not secret_key or not publishable_key:
-            log.error('Stripe is not configured: STRIPE_SECRET_KEY and/or STRIPE_PUBLISHABLE_KEY is missing')
-            return jsonify(error='الدفع غير مهيأ. تحقق من STRIPE_SECRET_KEY وSTRIPE_PUBLISHABLE_KEY في أسرار Fly.io.'), 503
+            log.error('Stripe configuration is missing')
+            return jsonify(error='الدفع غير مهيأ. تحقق من مفاتيح Stripe في أسرار Fly.io.'), 503
         if secret_key.startswith('sk_test_') != publishable_key.startswith('pk_test_'):
-            log.error('Stripe key modes do not match (test/live)')
             return jsonify(error='مفاتيح Stripe غير متطابقة بين وضع الاختبار والوضع الفعلي.'), 503
         try:
             stripe.api_key = secret_key
             intent = stripe.PaymentIntent.create(
-                amount=1000,
-                currency='gbp',
+                amount=1000, currency='gbp',
                 automatic_payment_methods={'enabled': True},
                 description='تبرع لدعم APK Analyzer',
                 metadata={'purpose': 'apk-analyzer-donation'},
             )
         except Exception as exc:
-            # Keep provider details in server logs only; never return secrets or raw Stripe errors to clients.
             log.exception('Stripe PaymentIntent creation failed (%s)', type(exc).__name__)
-            return jsonify(error='رفض Stripe إنشاء عملية الدفع. تحقق من صلاحية مفاتيح Stripe ووضع Test/Live، ثم راجع سجلات Fly.'), 502
+            return jsonify(error='رفض Stripe إنشاء عملية الدفع. تحقق من المفاتيح ووضع Test/Live، ثم راجع سجلات Fly.'), 502
         try:
             database.create_donation(intent.id, 1000)
         except Exception:
@@ -251,8 +250,8 @@ def create_app(test_config=None):
             try:
                 stripe.PaymentIntent.cancel(intent.id)
             except Exception:
-                log.exception('Could not cancel unrecorded PaymentIntent %s', intent.id)
-            return jsonify(error='تعذر حفظ سجل الدفع في قاعدة البيانات؛ ألغيت المحاولة إن أمكن. حاول لاحقاً.'), 503
+                log.exception('Could not cancel unrecorded intent')
+            return jsonify(error='تعذر حفظ سجل الدفع في قاعدة البيانات؛ حاول لاحقاً.'), 503
         return jsonify(client_secret=intent.client_secret, payment_intent_id=intent.id)
 
     @app.post('/api/stripe/webhook')
@@ -261,24 +260,17 @@ def create_app(test_config=None):
         if not secret:
             return jsonify(error='Webhook غير مهيأ.'), 503
         try:
-            event = stripe.Webhook.construct_event(
-                request.get_data(), request.headers.get('Stripe-Signature', ''), secret
-            )
+            event = stripe.Webhook.construct_event(request.get_data(), request.headers.get('Stripe-Signature', ''), secret)
         except (ValueError, stripe.error.SignatureVerificationError):
             return jsonify(error='توقيع Stripe غير صالح.'), 400
-        event_type = event['type']
+        transitions = {'payment_intent.succeeded': 'succeeded', 'payment_intent.payment_failed': 'failed', 'payment_intent.processing': 'processing'}
         obj = event['data']['object']
-        transitions = {
-            'payment_intent.succeeded': 'succeeded',
-            'payment_intent.payment_failed': 'failed',
-            'payment_intent.processing': 'processing',
-        }
-        if event_type in transitions:
+        if event['type'] in transitions:
             if obj.get('currency') != 'gbp' or obj.get('amount') != 1000 or obj.get('metadata', {}).get('purpose') != 'apk-analyzer-donation':
                 log.warning('Ignoring unexpected donation intent %s', obj.get('id'))
                 return jsonify(received=True)
             try:
-                database.apply_stripe_event(event['id'], obj['id'], transitions[event_type])
+                database.apply_stripe_event(event['id'], obj['id'], transitions[event['type']])
             except Exception:
                 log.exception('Could not persist Stripe event')
                 return jsonify(error='تعذر تسجيل حالة الدفع؛ سيعيد Stripe إرسال الحدث.'), 503
