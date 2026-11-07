@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#101827"><title>APK Analyzer</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<main class="wrap">
+  <header class="top"><div class="logo">APK</div><div><h1>محلل واستعادة تطبيقات Android</h1><p>استخراج الشفرة والموارد وتجهيز مشروع Android قابل للتعديل</p></div></header>
+
+  <section class="metrics-grid" aria-live="polite">
+    <article class="metric"><span class="metric-label">اتصال قاعدة البيانات</span><strong id="dbState" class="state pending">جارٍ الفحص</strong><small id="dbName">—</small></article>
+    <article class="metric"><span class="metric-label">سرعة استجابة قاعدة البيانات</span><strong id="dbLatency">—</strong><small id="dbVersion">—</small></article>
+    <article class="metric"><span class="metric-label">حجم قاعدة البيانات</span><strong id="dbSize">—</strong><small id="dbConnections">—</small></article>
+    <article class="metric"><span class="metric-label">ذاكرة التطبيق</span><strong id="appMemory">—</strong><small id="sysMemory">—</small></article>
+    <article class="metric"><span class="metric-label">مساحة التخزين المؤقت</span><strong id="diskFree">—</strong><small id="diskUsed">—</small></article>
+  </section>
+  <div class="metrics-foot"><span id="metricsUpdated">يتم تحديث المعلومات تلقائياً</span><button type="button" class="secondary small" id="refreshMetrics">تحديث الآن</button></div>
+
+  <section class="panel">
+    <form id="uploadForm">
+      <label class="drop" for="apk"><span class="cloud">↑</span><strong>اختر ملف APK أو اضغط هنا</strong><small>لا يوجد حدّ لحجم الملف محدد داخل التطبيق؛ قد تفرض منصة الاستضافة حدوداً تقنية</small><input id="apk" name="apk" type="file" accept=".apk,application/vnd.android.package-archive" required></label>
+      <div id="fileName" class="file-name">لم يتم اختيار ملف</div>
+      <button id="submit" type="submit">ابدأ تحليل APK</button>
+    </form>
+    <div id="progressArea" class="progress-area hidden"><div class="status-line"><b id="statusTitle">جارٍ تجهيز التحليل</b><span id="percent">0%</span></div><div class="track"><div id="bar"></div></div><p id="message">يرجى الانتظار...</p><a id="download" class="download hidden" href="#">تنزيل المشروع والنتائج ZIP</a></div>
+    <div id="error" class="error hidden"></div>
+  </section>
+
+  <section class="panel note"><h2>طريقة الاستعادة</h2><ul><li>يحاول JADX استخراج الشفرة أولاً.</li><li>عند تعذّر فك أجزاء، يحاول Apktool استخراج Smali والموارد كطريقة بديلة.</li><li>يتم تجاوز ملفات DEX التي تفشل بالأداتين إذا لم يتجاوز عددها 12 ملفاً.</li><li>إذا تجاوز الفشل 12 ملف DEX، تعتبر العملية فاشلة بالكامل.</li><li>تُضغط النتائج بسرعة مع الاحتفاظ بسجلات الأدوات.</li></ul><p class="warning">فك التطبيق لا يعيد المصدر الأصلي حرفياً. ملفات Smali بديل منخفض المستوى، وقد تحتاج إلى إصلاح التبعيات يدوياً.</p></section>
+
+  <section class="panel admin-panel">
+    <div class="section-head"><div><h2>إدارة قاعدة البيانات</h2><p class="muted">مسح سجلات التحليل والملفات الناتجة من مساحة التطبيق</p></div><span class="secure-label">إجراء محمي</span></div>
+    {% if admin_enabled %}
+      <label class="admin-label" for="adminToken">رمز الإدارة ADMIN_TOKEN</label>
+      <input id="adminToken" type="password" autocomplete="off" placeholder="أدخل رمز الإدارة الذي ضبطته في Fly.io">
+      <button id="clearDb" type="button" class="danger">مسح جميع سجلات وملفات التحليل</button>
+      <p id="clearMessage" class="muted"></p>
+    {% else %}
+      <p class="warning">زر المسح غير مفعّل بعد. أضف متغير البيئة ADMIN_TOKEN من إعدادات أسرار Fly.io لتفعيله.</p>
+    {% endif %}
+  </section>
+
+  <section class="panel"><h2>آخر العمليات</h2><div id="history" class="history">{% for item in history %}<div class="history-item"><span>{{ item.filename }}</span><em>{{ item.status }}</em></div>{% else %}<p class="muted">لا توجد عمليات سابقة.</p>{% endfor %}</div></section>
+  <footer>APK Analyzer · Python + Flask + PostgreSQL</footer>
+</main>
+<script>
+const form=document.getElementById('uploadForm'),fileInput=document.getElementById('apk'),fileName=document.getElementById('fileName'),submit=document.getElementById('submit');
+const area=document.getElementById('progressArea'),errorBox=document.getElementById('error');
+fileInput.addEventListener('change',()=>{fileName.textContent=fileInput.files[0]?.name||'لم يتم اختيار ملف';});
+form.addEventListener('submit',async(e)=>{e.preventDefault();errorBox.classList.add('hidden');if(!fileInput.files.length)return;submit.disabled=true;submit.textContent='جارٍ رفع الملف...';area.classList.remove('hidden');document.getElementById('download').classList.add('hidden');document.getElementById('bar').style.width='4%';try{const data=new FormData();data.append('apk',fileInput.files[0]);const response=await fetch('/api/analyze',{method:'POST',body:data});const result=await response.json();if(!response.ok)throw new Error(result.error||'تعذر رفع الملف');poll(result.id);}catch(err){showError(err.message);submit.disabled=false;submit.textContent='أعد المحاولة';}});
+async function poll(id){let ticks=0;const timer=setInterval(async()=>{try{const r=await fetch('/api/status/'+id);const s=await r.json();if(!r.ok)throw new Error(s.error||'تعذر قراءة الحالة');ticks++;const pct=s.status==='completed'||s.status==='failed'?100:Math.min(94,5+ticks*1.5);document.getElementById('bar').style.width=pct+'%';document.getElementById('percent').textContent=Math.round(pct)+'%';document.getElementById('statusTitle').textContent=s.status==='completed'?'اكتمل التحليل':s.status==='failed'?'فشل التحليل':'جارٍ تحليل التطبيق';document.getElementById('message').textContent=s.message||'';if(s.status==='completed'){clearInterval(timer);const a=document.getElementById('download');a.href='/download/'+id;a.classList.remove('hidden');submit.disabled=false;submit.textContent='تحليل ملف آخر';refreshHistory();}else if(s.status==='failed'){clearInterval(timer);showError(s.message||'حدث خطأ أثناء التحليل');submit.disabled=false;submit.textContent='أعد المحاولة';refreshHistory();}}catch(err){clearInterval(timer);showError(err.message);submit.disabled=false;submit.textContent='أعد المحاولة';}},1800);}
+function showError(msg){errorBox.textContent=msg;errorBox.classList.remove('hidden');}
+function escapeHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
+async function refreshHistory(){try{const r=await fetch('/api/history');const items=await r.json();document.getElementById('history').innerHTML=items.map(x=>`<div class="history-item"><span>${escapeHtml(x.filename)}</span><em>${escapeHtml(x.status)}</em></div>`).join('')||'<p class="muted">لا توجد عمليات سابقة.</p>';}catch(e){}}
+async function refreshMetrics(){try{const r=await fetch('/api/metrics',{cache:'no-store'});const x=await r.json();const db=x.database||{};const state=document.getElementById('dbState');if(db.connected){state.textContent='متصل';state.className='state online';document.getElementById('dbName').textContent='قاعدة: '+db.database_name;document.getElementById('dbLatency').textContent=db.response_ms+' ms';document.getElementById('dbVersion').textContent='PostgreSQL '+db.server_version;document.getElementById('dbSize').textContent=db.database_size;document.getElementById('dbConnections').textContent=`اتصالات ${db.active_connections} / ${db.max_connections}`;if(x.memory){document.getElementById('appMemory').textContent=x.memory.process;document.getElementById('sysMemory').textContent=`متاح ${x.memory.system_available} من ${x.memory.system_total}`;}if(x.disk){document.getElementById('diskFree').textContent=x.disk.free;document.getElementById('diskUsed').textContent=`مستخدم ${x.disk.used_percent}% من ${x.disk.total}`;}}else{state.textContent='غير متصل';state.className='state offline';document.getElementById('dbName').textContent=db.error||'تعذر الاتصال';}document.getElementById('metricsUpdated').textContent='آخر تحديث: '+new Date().toLocaleTimeString('ar-IQ');}catch(e){document.getElementById('dbState').textContent='تعذر الفحص';document.getElementById('dbState').className='state offline';}}
+document.getElementById('refreshMetrics').addEventListener('click',refreshMetrics);refreshMetrics();setInterval(refreshMetrics,15000);
+const clearBtn=document.getElementById('clearDb');if(clearBtn){clearBtn.addEventListener('click',async()=>{const token=document.getElementById('adminToken').value;const out=document.getElementById('clearMessage');if(!token){out.textContent='أدخل رمز الإدارة أولاً.';return;}if(!confirm('تحذير: سيتم حذف كل سجلات التحليل والملفات الناتجة نهائياً. هل تريد المتابعة؟'))return;clearBtn.disabled=true;out.textContent='جارٍ تنفيذ المسح...';try{const r=await fetch('/api/admin/clear-database',{method:'POST',headers:{'X-Admin-Token':token}});const result=await r.json();if(!r.ok)throw new Error(result.error||'فشل المسح');out.textContent=`تم المسح. السجلات المحذوفة: ${result.deleted_records}، عناصر الملفات: ${result.removed_items}`;refreshHistory();refreshMetrics();}catch(e){out.textContent=e.message;}finally{clearBtn.disabled=false;}});}
+</script>
+</body></html>
