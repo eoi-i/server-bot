@@ -53,7 +53,7 @@ def enqueue_analysis(job_id, filename, upload_path, size, fingerprint):
         if duplicate:
             raise DuplicateAnalysisError('هذا الملف قيد المعالجة أو سبق تحليله بنجاح.')
         conn.execute(
-            'INSERT INTO analyses (id,filename,status,message,upload_path,file_size,fingerprint) VALUES (%s,%s,\'queued\',%s,%s,%s,%s)',
+            "INSERT INTO analyses (id,filename,status,message,upload_path,file_size,fingerprint) VALUES (%s,%s,'queued',%s,%s,%s,%s)",
             (job_id, filename, 'في قائمة الانتظار.', upload_path, size, fingerprint),
         )
 
@@ -104,6 +104,17 @@ def cancel_requested(job_id):
     with connect() as conn:
         row = conn.execute('SELECT cancel_requested FROM analyses WHERE id=%s', (job_id,)).fetchone()
         return bool(row and row['cancel_requested'])
+
+
+def clear_analysis_history():
+    """Delete analysis rows only, atomically refusing to clear queued/running jobs. Donations/events stay intact."""
+    with connect() as conn:
+        conn.execute('LOCK TABLE analyses IN EXCLUSIVE MODE')
+        active = conn.execute("SELECT count(*) AS n FROM analyses WHERE status IN ('queued','processing')").fetchone()['n']
+        if active:
+            return False, active
+        deleted = conn.execute('DELETE FROM analyses').rowcount
+    return True, deleted
 
 
 def recover_stale_jobs(stale_seconds=3600):

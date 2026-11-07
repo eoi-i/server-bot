@@ -3,6 +3,7 @@ import logging
 import os
 import secrets
 import time
+import shutil
 from pathlib import Path
 
 import stripe
@@ -77,7 +78,7 @@ def create_app(test_config=None):
         except Exception:
             log.exception('Could not load analyses')
             history = []
-        return render_template('index.html', history=history, max_upload=app.config['MAX_CONTENT_LENGTH'])
+        return render_template('index.html', history=history, max_upload=app.config['MAX_CONTENT_LENGTH'], admin_enabled=bool(os.getenv('ADMIN_TOKEN')))
 
     @app.get('/history')
     def history_page():
@@ -169,6 +170,39 @@ def create_app(test_config=None):
             return jsonify(error='لا يمكن إلغاء هذه المهمة؛ ربما انتهت بالفعل.'), 409
         return jsonify(status='cancel_requested')
 
+    @app.post('/api/admin/clear-analyses')
+    def clear_analyses_api():
+        expected = os.getenv('ADMIN_TOKEN', '')
+        supplied = request.headers.get('X-Admin-Token', '')
+        if not expected:
+            return jsonify(error='ميزة مسح سجل التحليلات غير مفعلة. اضبط ADMIN_TOKEN ��ي أسرار Fly.io.'), 503
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            return jsonify(error='رمز الإدارة غير صحيح.'), 403
+        try:
+            cleared, active = database.clear_analysis_history()
+            if not cleared:
+                return jsonify(error=f'لم يتم المسح: توجد {active} مهام قيد التنفيذ. ألغها أو انتظر انتهاءها.'), 409
+            removed = 0
+            data_root = Path(app.config['DATA_DIR']).resolve()
+            for name in ('uploads', 'work', 'results'):
+                folder = (data_root / name).resolve()
+                if data_root not in folder.parents or not folder.is_dir():
+                    continue
+                for item in folder.iterdir():
+                    try:
+                        if item.is_dir() and not item.is_symlink():
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink(missing_ok=True)
+                        removed += 1
+                    except OSError:
+                        log.exception('Unable to remove analysis artifact %s', item)
+            return jsonify(ok=True, deleted_analyses=active, removed_items=removed,
+                           note='تم حذف سجلات التحليلات وملفاتها فقط؛ سجلات التبرعات لم تتغير.')
+        except Exception:
+            log.exception('Analysis history clear failed')
+            return jsonify(error='تعذر مسح سجل التحليلات. راجع سجلات الخادم.'), 503
+
     @app.get('/download/<job_id>')
     def download(job_id):
         try:
@@ -189,9 +223,16 @@ def create_app(test_config=None):
 
     @app.post('/api/create-payment-intent')
     def create_payment_intent():
-        if not stripe.api_key or not os.getenv('STRIPE_PUBLISHABLE_KEY'):
-            return jsonify(error='الدفع غير مهيأ حالياً.'), 503
+        secret_key = os.getenv('STRIPE_SECRET_KEY', '').strip()
+        publishable_key = os.getenv('STRIPE_PUBLISHABLE_KEY', '').strip()
+        if not secret_key or not publishable_key:
+            log.error('Stripe is not configured: STRIPE_SECRET_KEY and/or STRIPE_PUBLISHABLE_KEY is missing')
+            return jsonify(error='الدفع غير مهيأ. تحقق من STRIPE_SECRET_KEY وSTRIPE_PUBLISHABLE_KEY في أسرار Fly.io.'), 503
+        if secret_key.startswith('sk_test_') != publishable_key.startswith('pk_test_'):
+            log.error('Stripe key modes do not match (test/live)')
+            return jsonify(error='مفاتيح Stripe غير متطابقة بين وضع الاختبار والوضع الفعلي.'), 503
         try:
+            stripe.api_key = secret_key
             intent = stripe.PaymentIntent.create(
                 amount=1000,
                 currency='gbp',
@@ -199,14 +240,20 @@ def create_app(test_config=None):
                 description='تبرع لدعم APK Analyzer',
                 metadata={'purpose': 'apk-analyzer-donation'},
             )
+        except Exception as exc:
+            # Keep provider details in server logs only; never return secrets or raw Stripe errors to clients.
+            log.exception('Stripe PaymentIntent creation failed (%s)', type(exc).__name__)
+            return jsonify(error='رفض Stripe إنشاء عملية الدفع. تحقق من صلاحية مفاتيح Stripe ووضع Test/Live، ثم راجع سجلات Fly.'), 502
+        try:
             database.create_donation(intent.id, 1000)
-            return jsonify(client_secret=intent.client_secret, payment_intent_id=intent.id)
-        except stripe.error.StripeError:
-            log.exception('Stripe intent creation failed')
-            return jsonify(error='تعذر بدء الدفع. لم يتم حفظ بيانات البطاقة.'), 502
         except Exception:
-            log.exception('Payment intent persistence failed')
-            return jsonify(error='تعذر بدء الدفع بأمان. حاول لاحقاً.'), 503
+            log.exception('Could not persist Stripe intent %s', intent.id)
+            try:
+                stripe.PaymentIntent.cancel(intent.id)
+            except Exception:
+                log.exception('Could not cancel unrecorded PaymentIntent %s', intent.id)
+            return jsonify(error='تعذر حفظ سجل الدفع في قاعدة البيانات؛ ألغيت المحاولة إن أمكن. حاول لاحقاً.'), 503
+        return jsonify(client_secret=intent.client_secret, payment_intent_id=intent.id)
 
     @app.post('/api/stripe/webhook')
     def stripe_webhook():
@@ -247,6 +294,7 @@ def create_app(test_config=None):
         try:
             donation = database.get_donation(intent_id) if intent_id else None
         except Exception:
+            log.exception('Could not load donation status')
             donation = None
         return render_template('donation_status.html', donation=donation)
 
